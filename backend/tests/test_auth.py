@@ -1,150 +1,82 @@
 from __future__ import annotations
 
-import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-import jwt
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
-from app.dependencies import _verify_clerk_token, get_settings
-
-
-def _generate_rsa_keypair() -> tuple[bytes, dict]:
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    public_numbers = private_key.public_key().public_numbers()
-    jwk = {
-        "kty": "RSA",
-        "kid": "test-kid",
-        "use": "sig",
-        "alg": "RS256",
-        "n": jwt.utils.base64url_encode(
-            public_numbers.n.to_bytes(
-                (public_numbers.n.bit_length() + 7) // 8, byteorder="big"
-            )
-        ).decode(),
-        "e": jwt.utils.base64url_encode(
-            public_numbers.e.to_bytes(
-                (public_numbers.e.bit_length() + 7) // 8, byteorder="big"
-            )
-        ).decode(),
-    }
-    return private_pem, jwk
+from app.dependencies import get_current_user_id, get_settings
+from app.settings import Settings
 
 
-@pytest.fixture
-def clerk_keypair(
-    monkeypatch: pytest.MonkeyPatch,
-) -> tuple[bytes, dict, str]:
-    private_pem, jwk = _generate_rsa_keypair()
-    issuer = "https://test-instance.clerk.accounts.dev"
-    monkeypatch.setenv("CLERK_ISSUER", issuer)
-    monkeypatch.setenv("CLERK_JWKS_URL", f"{issuer}/.well-known/jwks.json")
-    monkeypatch.setenv("CLERK_AUTHORIZED_PARTIES", "http://localhost:3000")
+def _make_mock_request(token: str | None, x_user_id: str | None = None) -> Request:
+    headers_dict = {}
+    if token:
+        headers_dict["Authorization"] = f"Bearer {token}"
+        headers_dict["authorization"] = f"Bearer {token}"
+    if x_user_id:
+        headers_dict["X-User-ID"] = x_user_id
+        headers_dict["x-user-id"] = x_user_id
+    
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = headers_dict
+    return mock_request
+
+
+def test_firebase_auth_disabled_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Test that when auth is disabled, get_current_user_id falls back to unverified decode or "admin"
+    monkeypatch.delenv("FIREBASE_PROJECT_ID", raising=False)
     get_settings.cache_clear()
-    return private_pem, jwk, issuer
-
-
-def _make_token(
-    private_pem: bytes, issuer: str, azp: str, sub: str = "user_clerk_test_123"
-) -> str:
-    now = int(time.time())
-    return jwt.encode(
-        {
-            "sub": sub,
-            "iss": issuer,
-            "azp": azp,
-            "iat": now,
-            "exp": now + 3600,
-        },
-        private_pem,
-        algorithm="RS256",
-        headers={"kid": "test-kid"},
-    )
-
-
-def test_clerk_jwt_verified(clerk_keypair: tuple[bytes, dict, str]) -> None:
-    private_pem, jwk, issuer = clerk_keypair
-    token = _make_token(private_pem, issuer, "http://localhost:3000")
     settings = get_settings()
+    request = _make_mock_request(token=None)
+    
+    user_id = get_current_user_id(request, settings)
+    assert user_id == "admin"
 
-    with patch("app.dependencies.get_jwks", return_value={"keys": [jwk]}):
-        payload = _verify_clerk_token(token, settings)
 
-    assert payload["sub"] == "user_clerk_test_123"
-
-
-def test_clerk_invalid_azp_rejected(clerk_keypair: tuple[bytes, dict, str]) -> None:
-    private_pem, jwk, issuer = clerk_keypair
-    token = _make_token(private_pem, issuer, "https://evil.example.com")
+def test_firebase_auth_x_user_id_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Test that X-User-ID header overrides standard token validation
+    monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
+    get_settings.cache_clear()
     settings = get_settings()
+    request = _make_mock_request(token=None, x_user_id="custom-user-123")
+    
+    user_id = get_current_user_id(request, settings)
+    assert user_id == "custom-user-123"
 
-    with patch("app.dependencies.get_jwks", return_value={"keys": [jwk]}):
-        with pytest.raises(HTTPException) as exc_info:
-            _verify_clerk_token(token, settings)
 
+@patch("firebase_admin.auth.verify_id_token")
+@patch("firebase_admin.initialize_app")
+def test_firebase_token_verified(mock_init: MagicMock, mock_verify: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
+    get_settings.cache_clear()
+    settings = get_settings()
+    
+    # Token length >= 50 and exactly 2 dots
+    long_jwt_token = "valid_firebase_token_part1_that_is_long_enough_to_exceed_fifty_characters." + "part2_signature_part." + "part3_value"
+    request = _make_mock_request(token=long_jwt_token)
+    mock_verify.return_value = {"uid": "user_firebase_123"}
+
+    user_id = get_current_user_id(request, settings)
+    
+    assert user_id == "user_firebase_123"
+    mock_verify.assert_called_once_with(long_jwt_token)
+
+
+@patch("firebase_admin.auth.verify_id_token")
+@patch("firebase_admin.initialize_app")
+def test_firebase_token_invalid_throws_401(mock_init: MagicMock, mock_verify: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
+    get_settings.cache_clear()
+    settings = get_settings()
+    
+    # Token length >= 50 and exactly 2 dots
+    long_jwt_token = "invalid_firebase_token_part1_that_is_long_enough_to_exceed_fifty_characters." + "part2_signature_part." + "part3_value"
+    request = _make_mock_request(token=long_jwt_token)
+    mock_verify.side_effect = Exception("Token expired")
+
+    with pytest.raises(HTTPException) as exc_info:
+        get_current_user_id(request, settings)
+        
     assert exc_info.value.status_code == 401
-
-
-def test_clerk_jwt_leeway(clerk_keypair: tuple[bytes, dict, str]) -> None:
-    private_pem, jwk, issuer = clerk_keypair
-    now = int(time.time())
-    # Generate token that expired 10 seconds ago
-    token = jwt.encode(
-        {
-            "sub": "user_clerk_test_123",
-            "iss": issuer,
-            "azp": "http://localhost:3000",
-            "iat": now - 70,
-            "exp": now - 10,
-        },
-        private_pem,
-        algorithm="RS256",
-        headers={"kid": "test-kid"},
-    )
-    settings = get_settings()
-
-    with patch("app.dependencies.get_jwks", return_value={"keys": [jwk]}):
-        payload = _verify_clerk_token(token, settings)
-
-    assert payload["sub"] == "user_clerk_test_123"
-
-
-def test_clerk_jwt_trailing_slash_issuer(clerk_keypair: tuple[bytes, dict, str], monkeypatch: pytest.MonkeyPatch) -> None:
-    private_pem, jwk, issuer = clerk_keypair
-    # Set settings issuer WITH trailing slash
-    monkeypatch.setenv("CLERK_ISSUER", issuer + "/")
-    get_settings.cache_clear()
-    settings = get_settings()
-    
-    # Token has issuer WITHOUT trailing slash
-    token = _make_token(private_pem, issuer, "http://localhost:3000")
-
-    with patch("app.dependencies.get_jwks", return_value={"keys": [jwk]}):
-        payload = _verify_clerk_token(token, settings)
-
-    assert payload["sub"] == "user_clerk_test_123"
-
-
-def test_clerk_jwt_azp_trailing_slash(clerk_keypair: tuple[bytes, dict, str], monkeypatch: pytest.MonkeyPatch) -> None:
-    private_pem, jwk, issuer = clerk_keypair
-    # Configure expected party with trailing slash
-    monkeypatch.setenv("CLERK_AUTHORIZED_PARTIES", "http://localhost:3000/")
-    get_settings.cache_clear()
-    settings = get_settings()
-    
-    # Token has azp WITHOUT trailing slash
-    token = _make_token(private_pem, issuer, "http://localhost:3000")
-
-    with patch("app.dependencies.get_jwks", return_value={"keys": [jwk]}):
-        payload = _verify_clerk_token(token, settings)
-
-    assert payload["sub"] == "user_clerk_test_123"
-
+    assert "Token verification failed" in exc_info.value.detail

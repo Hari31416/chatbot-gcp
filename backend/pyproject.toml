@@ -11,13 +11,9 @@ dependencies = [
   "litellm>=1.41.0",
   "PyJWT>=2.8.0",
   "cryptography>=42.0.0",
-  "azure-storage-blob>=12.20.0",
-  "azure-cosmos>=4.7.0",
-  "azure-ai-documentintelligence>=1.0.0b4",
-  "azure-storage-queue>=12.10.0",
-  "azure-identity>=1.17.0",
-  "azure-keyvault-secrets>=4.8.0",
-  "azure-functions",
+  "google-cloud-storage>=2.18.0",
+  "google-cloud-firestore>=2.19.0",
+  "firebase-admin>=6.6.0",
 ]
 
 

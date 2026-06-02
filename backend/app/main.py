@@ -3,7 +3,7 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from azure.cosmos.exceptions import CosmosHttpResponseError
+from google.api_core.exceptions import GoogleAPICallError
 
 from .api.routes import router
 from .logging_config import configure_logging
@@ -14,9 +14,9 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Chatbot API")
 
-@app.exception_handler(CosmosHttpResponseError)
-async def cosmos_http_exception_handler(request: Request, exc: CosmosHttpResponseError):
-    logger.error("Cosmos DB operation failed: %s", exc.message)
+@app.exception_handler(GoogleAPICallError)
+async def firestore_exception_handler(request: Request, exc: GoogleAPICallError):
+    logger.error("Firestore operation failed: %s", exc.message)
     return JSONResponse(
         status_code=400,
         content={"detail": f"Database operation failed: {exc.message}"}
@@ -40,4 +40,3 @@ def health() -> dict[str, str]:
 
 
 logger.info("Chatbot API initialised")
-

@@ -13,10 +13,10 @@ import {
 } from "./services/api";
 import { useToast } from "@/components/ui/Toast";
 import { useTheme } from "@/components/theme-provider";
-import { useAuth } from "@clerk/react";
+import { onAuthStateChanged, signOut as firebaseSignOut } from "firebase/auth";
+import { auth } from "./services/firebase";
 import { getCurrentSessionToken } from "./services/auth";
 import { AuthGate } from "./components/AuthGate";
-import { ClerkAuthSync } from "./components/ClerkAuthSync";
 import { Sidebar } from "./components/Sidebar";
 import { ChatFeed } from "./components/ChatFeed";
 import { InputBar } from "./components/InputBar";
@@ -26,22 +26,44 @@ import { DocumentsModal } from "./components/DocumentsModal";
 export function App() {
   const { toast } = useToast();
   const { theme, setTheme } = useTheme();
-  const { isLoaded: isClerkLoaded, signOut } = useAuth();
 
   // --- Authentication State ---
   const [isLoggedIn, setIsLoggedIn] = React.useState(false);
   const [userId, setUserId] = React.useState<string>("Guest");
-  const handleAuthChange = React.useCallback(
-    (signedIn: boolean, displayLabel: string) => {
-      setIsLoggedIn(signedIn);
-      if (signedIn) {
-        setUserId(displayLabel);
+  const [authLoading, setAuthLoading] = React.useState(true);
+
+  React.useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (user) {
+        setIsLoggedIn(true);
+        setUserId(user.email || user.uid || "Guest");
       } else {
+        setIsLoggedIn(false);
         setUserId("Guest");
       }
-    },
-    [],
-  );
+      setAuthLoading(false);
+    });
+    return unsubscribe;
+  }, []);
+
+  const handleLogout = async () => {
+    try {
+      await firebaseSignOut(auth);
+      setIsLoggedIn(false);
+      setActiveConversationId(null);
+      toast({
+        title: "Logged Out",
+        description: "Session terminated successfully.",
+        type: "info",
+      });
+    } catch (err: any) {
+      toast({
+        title: "Logout Error",
+        description: err.message || "Failed to log out.",
+        type: "error",
+      });
+    }
+  };
 
   // --- Configuration State ---
   const [apiBaseUrl, setApiBaseUrl] = React.useState<string>(() => {
@@ -196,10 +218,13 @@ export function App() {
     };
   }, [activeConversationId, apiBaseUrl, isLoggedIn]);
 
-  // Automatic logout on unauthorized API errors (session expired)
   React.useEffect(() => {
-    const handleUnauthorized = () => {
-      void signOut();
+    const handleUnauthorized = async () => {
+      try {
+        await firebaseSignOut(auth);
+      } catch (e) {
+        console.error(e);
+      }
       setIsLoggedIn(false);
       setActiveConversationId(null);
       toast({
@@ -214,17 +239,6 @@ export function App() {
       window.removeEventListener("unauthorized-api-error", handleUnauthorized);
     };
   }, [toast]);
-
-  const handleLogout = () => {
-    void signOut();
-    setIsLoggedIn(false);
-    setActiveConversationId(null);
-    toast({
-      title: "Logged Out",
-      description: "Session terminated successfully.",
-      type: "info",
-    });
-  };
 
   // --- Message mutation handlers ---
   const sendMutation = useMutation({
@@ -603,7 +617,7 @@ export function App() {
     ? messages[activeConversationId] || []
     : [];
 
-  if (!isClerkLoaded) {
+  if (authLoading) {
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-zinc-50 dark:bg-zinc-950 text-sm text-zinc-500">
         Loading…
@@ -612,17 +626,11 @@ export function App() {
   }
 
   if (!isLoggedIn) {
-    return (
-      <>
-        <ClerkAuthSync onAuthChange={handleAuthChange} />
-        <AuthGate />
-      </>
-    );
+    return <AuthGate />;
   }
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-zinc-50 font-sans text-zinc-800 dark:bg-zinc-950 dark:text-zinc-100">
-      <ClerkAuthSync onAuthChange={handleAuthChange} />
       {/* Sidebar Component */}
       <Sidebar
         isSidebarOpen={isSidebarOpen}

@@ -7,7 +7,7 @@
 
 ## Migration Principles
 
-1. **Azure remains deployable until cutover** — add GCP infrastructure and adapters incrementally.
+1. **Backward compatibility not Required** — You can have breaking changes and do not need to worry about Azure deployment.
 2. **Minimal-cost PoC** — choose scale-to-zero compute, one Firestore database, small retention windows, and billing alerts.
 3. **Mumbai-first deployment** — deploy application resources in `asia-south1` unless a documented cost trade-off justifies another region.
 4. **Empty GCP data plane** — do not migrate Cosmos DB records or Blob Storage objects.

@@ -306,27 +306,27 @@ export function ChatFeed({
             Serverless Chatbot Platform
           </h1>
           <p className="text-sm text-zinc-450 max-w-sm">
-            Securely authenticated via Clerk. Deployed on Azure Container Apps.
+            Securely authenticated via Firebase. Deployed on Google Cloud Run.
           </p>
 
           <div className="flex gap-2 w-full max-w-md pt-4 justify-center">
             <button
               onClick={() =>
-                setInputText("How do Azure Container Apps run serverless containers?")
+                setInputText("How do Google Cloud Run services run serverless containers?")
               }
               className="p-3 text-xs border border-zinc-250 dark:border-zinc-800 bg-white dark:bg-zinc-900 rounded-lg shadow-xs hover:bg-zinc-50 transition text-left w-full cursor-pointer"
             >
-              Cloud Architecture Container Apps
+              Cloud Run Architecture
             </button>
             <button
               onClick={() =>
                 setInputText(
-                  "Explain how Azure Static Web Apps host React applications.",
+                  "Explain how Firebase Hosting serves static React applications.",
                 )
               }
               className="p-3 text-xs border border-zinc-250 dark:border-zinc-800 bg-white dark:bg-zinc-900 rounded-lg shadow-xs hover:bg-zinc-50 transition text-left w-full cursor-pointer"
             >
-              SWA Hosting Guidelines
+              Firebase Hosting Guidelines
             </button>
           </div>
         </div>

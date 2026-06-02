@@ -1,0 +1,6 @@
+__pycache__
+.env
+.venv
+.python_packages
+.pytest_cache
+chatbot_backend.egg-info

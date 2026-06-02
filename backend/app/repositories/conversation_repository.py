@@ -3,15 +3,15 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from azure.cosmos.exceptions import CosmosResourceNotFoundError, CosmosHttpResponseError
+from google.cloud import firestore
 
 logger = logging.getLogger(__name__)
 
 
 class ConversationRepository:
-    def __init__(self, container: Any) -> None:
-        self._container = container
-        logger.info("ConversationRepository initialised with Cosmos container")
+    def __init__(self, client: firestore.Client) -> None:
+        self._client = client
+        logger.info("ConversationRepository initialised with Firestore Native client")
 
     def create_conversation(
         self,
@@ -20,35 +20,27 @@ class ConversationRepository:
         user_id: str | None,
         name: str = "New Chat...",
     ) -> None:
+        user_id = user_id or "admin"
         logger.debug(
             "create_conversation conversation_id=%s user_id=%s name=%s",
             conversation_id,
             user_id,
             name,
         )
-        item = {
-            "id": f"{conversation_id}_META",
-            "conversationId": conversation_id,
-            "pk": f"CONV#{conversation_id}",
-            "sk": "META",
-            "type": "META",
+        doc_ref = (
+            self._client.collection("users")
+            .document(user_id)
+            .collection("conversations")
+            .document(conversation_id)
+        )
+        doc_ref.set({
             "conversation_id": conversation_id,
             "created_at": created_at,
             "updated_at": created_at,
+            "user_id": user_id,
             "name": name,
-        }
-        if user_id:
-            item["user_id"] = user_id
-
-        try:
-            self._container.upsert_item(body=item)
-            logger.debug("Conversation created in Cosmos DB conversation_id=%s", conversation_id)
-        except CosmosHttpResponseError:
-            logger.exception(
-                "CosmosDB error creating conversation conversation_id=%s",
-                conversation_id,
-            )
-            raise
+        })
+        logger.debug("Conversation created in Firestore conversation_id=%s", conversation_id)
 
     def put_message(
         self,
@@ -67,12 +59,30 @@ class ConversationRepository:
             message_id,
             role,
         )
+        
+        # If user_id is not passed, find it from the conversation document
+        if not user_id:
+            convs = (
+                self._client.collection_group("conversations")
+                .where("conversation_id", "==", conversation_id)
+                .limit(1)
+                .get()
+            )
+            if convs:
+                user_id = convs[0].reference.parent.parent.id
+            else:
+                user_id = "admin"
+
+        msg_ref = (
+            self._client.collection("users")
+            .document(user_id)
+            .collection("conversations")
+            .document(conversation_id)
+            .collection("messages")
+            .document(message_id)
+        )
+
         item = {
-            "id": f"{conversation_id}_MSG_{message_id}",
-            "conversationId": conversation_id,
-            "pk": f"CONV#{conversation_id}",
-            "sk": f"MSG#{created_at}#{message_id}",
-            "type": "MSG",
             "message_id": message_id,
             "role": role,
             "content": content,
@@ -82,31 +92,34 @@ class ConversationRepository:
             item["attachment"] = attachment
         if attachments:
             item["attachments"] = attachments
-        if user_id:
-            item["user_id"] = user_id
 
-        self._container.upsert_item(body=item)
+        msg_ref.set(item)
 
     def get_recent_messages(self, conversation_id: str, limit: int) -> list[dict]:
         logger.debug(
             "get_recent_messages conversation_id=%s limit=%d", conversation_id, limit
         )
-        query = (
-            "SELECT * FROM c WHERE c.conversationId = @convId AND c.type = 'MSG' "
-            "ORDER BY c.created_at DESC"
+        convs = (
+            self._client.collection_group("conversations")
+            .where("conversation_id", "==", conversation_id)
+            .limit(1)
+            .get()
         )
-        params = [
-            {"name": "@convId", "value": conversation_id}
-        ]
-        items = list(self._container.query_items(
-            query=query,
-            parameters=params,
-            partition_key=conversation_id,
-        ))
+        if not convs:
+            return []
+        user_id = convs[0].reference.parent.parent.id
+
+        messages_ref = (
+            self._client.collection("users")
+            .document(user_id)
+            .collection("conversations")
+            .document(conversation_id)
+            .collection("messages")
+        )
         
-        # Trim to limit and reverse to restore chronological order (older first)
-        items = items[:limit]
-        items.reverse()
+        query = messages_ref.order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit)
+        items = [doc.to_dict() for doc in query.get()]
+        items.reverse()  # Restore older first chronological order
         
         logger.debug(
             "get_recent_messages returned %d messages conversation_id=%s",
@@ -117,20 +130,32 @@ class ConversationRepository:
 
     def get_context(self, conversation_id: str) -> dict | None:
         logger.debug("get_context conversation_id=%s", conversation_id)
-        try:
-            item = self._container.read_item(
-                item=f"{conversation_id}_CTX",
-                partition_key=conversation_id,
-            )
-            logger.debug(
-                "get_context conversation_id=%s found=True", conversation_id
-            )
-            return item
-        except CosmosResourceNotFoundError:
-            logger.debug(
-                "get_context conversation_id=%s found=False", conversation_id
-            )
+        convs = (
+            self._client.collection_group("conversations")
+            .where("conversation_id", "==", conversation_id)
+            .limit(1)
+            .get()
+        )
+        if not convs:
             return None
+        user_id = convs[0].reference.parent.parent.id
+
+        context_ref = (
+            self._client.collection("users")
+            .document(user_id)
+            .collection("conversations")
+            .document(conversation_id)
+            .collection("state")
+            .document("context")
+        )
+        
+        doc = context_ref.get()
+        if doc.exists:
+            logger.debug("get_context conversation_id=%s found=True", conversation_id)
+            return doc.to_dict()
+            
+        logger.debug("get_context conversation_id=%s found=False", conversation_id)
+        return None
 
     def set_context(
         self,
@@ -145,29 +170,42 @@ class ConversationRepository:
             len(messages),
             ttl_epoch,
         )
-        item = {
-            "id": f"{conversation_id}_CTX",
+        convs = (
+            self._client.collection_group("conversations")
+            .where("conversation_id", "==", conversation_id)
+            .limit(1)
+            .get()
+        )
+        if convs:
+            user_id = convs[0].reference.parent.parent.id
+        else:
+            user_id = "admin"
+
+        context_ref = (
+            self._client.collection("users")
+            .document(user_id)
+            .collection("conversations")
+            .document(conversation_id)
+            .collection("state")
+            .document("context")
+        )
+
+        context_ref.set({
             "conversationId": conversation_id,
-            "pk": f"CONV#{conversation_id}",
-            "sk": "CTX",
-            "type": "CTX",
             "messages": messages,
             "ttl": ttl_epoch,
             "updated_at": updated_at,
-        }
-        self._container.upsert_item(body=item)
+        })
 
     def get_user_conversations(self, user_id: str) -> list[dict]:
         logger.debug("get_user_conversations user_id=%s", user_id)
-        query = (
-            "SELECT * FROM c WHERE c.user_id = @userId AND c.type = 'META'"
+        convs_ref = (
+            self._client.collection("users")
+            .document(user_id)
+            .collection("conversations")
         )
-        params = [{"name": "@userId", "value": user_id}]
-        items = list(self._container.query_items(
-            query=query,
-            parameters=params,
-            enable_cross_partition_query=True,
-        ))
+        
+        items = [doc.to_dict() for doc in convs_ref.get()]
         items.sort(
             key=lambda x: x.get("updated_at", x.get("created_at", "")), reverse=True
         )
@@ -175,13 +213,15 @@ class ConversationRepository:
 
     def get_conversation_meta(self, conversation_id: str) -> dict | None:
         logger.debug("get_conversation_meta conversation_id=%s", conversation_id)
-        try:
-            return self._container.read_item(
-                item=f"{conversation_id}_META",
-                partition_key=conversation_id,
-            )
-        except CosmosResourceNotFoundError:
-            return None
+        convs = (
+            self._client.collection_group("conversations")
+            .where("conversation_id", "==", conversation_id)
+            .limit(1)
+            .get()
+        )
+        if convs:
+            return convs[0].to_dict()
+        return None
 
     def update_conversation(
         self, conversation_id: str, name: str, updated_at: str
@@ -189,49 +229,70 @@ class ConversationRepository:
         logger.debug(
             "update_conversation conversation_id=%s name=%s", conversation_id, name
         )
-        meta = self.get_conversation_meta(conversation_id)
-        if meta:
-            meta["name"] = name
-            meta["updated_at"] = updated_at
-            self._container.upsert_item(body=meta)
+        convs = (
+            self._client.collection_group("conversations")
+            .where("conversation_id", "==", conversation_id)
+            .limit(1)
+            .get()
+        )
+        if convs:
+            convs[0].reference.update({
+                "name": name,
+                "updated_at": updated_at,
+            })
 
     def get_all_messages(self, conversation_id: str) -> list[dict]:
         logger.debug("get_all_messages conversation_id=%s", conversation_id)
-        query = (
-            "SELECT * FROM c WHERE c.conversationId = @convId AND c.type = 'MSG' "
-            "ORDER BY c.created_at ASC"
+        convs = (
+            self._client.collection_group("conversations")
+            .where("conversation_id", "==", conversation_id)
+            .limit(1)
+            .get()
         )
-        params = [
-            {"name": "@convId", "value": conversation_id}
-        ]
-        return list(self._container.query_items(
-            query=query,
-            parameters=params,
-            partition_key=conversation_id,
-        ))
+        if not convs:
+            return []
+        user_id = convs[0].reference.parent.parent.id
+
+        messages_ref = (
+            self._client.collection("users")
+            .document(user_id)
+            .collection("conversations")
+            .document(conversation_id)
+            .collection("messages")
+        )
+        
+        docs = messages_ref.order_by("created_at", direction=firestore.Query.ASCENDING).get()
+        return [doc.to_dict() for doc in docs]
 
     def delete_conversation(self, conversation_id: str) -> None:
         logger.debug("delete_conversation conversation_id=%s", conversation_id)
-        query = (
-            "SELECT c.id FROM c WHERE c.conversationId = @convId"
+        convs = (
+            self._client.collection_group("conversations")
+            .where("conversation_id", "==", conversation_id)
+            .limit(1)
+            .get()
         )
-        params = [
-            {"name": "@convId", "value": conversation_id}
-        ]
-        items = list(self._container.query_items(
-            query=query,
-            parameters=params,
-            partition_key=conversation_id,
-        ))
+        if not convs:
+            return
+        user_id = convs[0].reference.parent.parent.id
+
+        conv_ref = (
+            self._client.collection("users")
+            .document(user_id)
+            .collection("conversations")
+            .document(conversation_id)
+        )
         
-        for item in items:
-            try:
-                self._container.delete_item(
-                    item=item["id"],
-                    partition_key=conversation_id,
-                )
-            except CosmosResourceNotFoundError:
-                pass
+        # Delete all messages in the messages subcollection
+        for msg in conv_ref.collection("messages").get():
+            msg.reference.delete()
+            
+        # Delete all documents in the state subcollection
+        for st in conv_ref.collection("state").get():
+            st.reference.delete()
+            
+        # Delete the main conversation metadata document
+        conv_ref.delete()
 
     def put_rag_document(
         self,
@@ -249,22 +310,23 @@ class ConversationRepository:
             filename,
             status,
         )
-        item = {
-            "id": f"{user_id}_RAGDOC_{document_id}",
-            "conversationId": f"_user_{user_id}",
-            "pk": f"USER#{user_id}",
-            "sk": f"RAGDOC#{created_at}#{document_id}",
-            "type": "RAGDOC",
-            "user_id": user_id,
+        doc_ref = (
+            self._client.collection("users")
+            .document(user_id)
+            .collection("rag_documents")
+            .document(document_id)
+        )
+        
+        doc_ref.set({
             "document_id": document_id,
+            "user_id": user_id,
             "filename": filename,
             "source_doc": filename,
             "chunks_ingested": chunks_ingested,
             "status": status,
             "created_at": created_at,
             "updated_at": created_at,
-        }
-        self._container.upsert_item(body=item)
+        })
 
     def update_rag_document_status(
         self,
@@ -281,30 +343,33 @@ class ConversationRepository:
             status,
             chunks_ingested,
         )
-        doc_id = f"{user_id}_RAGDOC_{document_id}"
-        partition_key = f"_user_{user_id}"
+        doc_ref = (
+            self._client.collection("users")
+            .document(user_id)
+            .collection("rag_documents")
+            .document(document_id)
+        )
         try:
-            item = self._container.read_item(item=doc_id, partition_key=partition_key)
-            item["status"] = status
-            item["chunks_ingested"] = chunks_ingested
-            item["updated_at"] = updated_at
-            self._container.upsert_item(body=item)
-        except CosmosResourceNotFoundError:
-            logger.warning("RAG document not found for update user_id=%s document_id=%s", user_id, document_id)
+            doc_ref.update({
+                "status": status,
+                "chunks_ingested": chunks_ingested,
+                "updated_at": updated_at,
+            })
+        except Exception as exc:
+            logger.warning(
+                "RAG document not found for update user_id=%s document_id=%s. Error: %s",
+                user_id, document_id, exc
+            )
 
     def list_rag_documents(self, user_id: str) -> list[dict]:
         logger.debug("list_rag_documents user_id=%s", user_id)
-        query = (
-            "SELECT * FROM c WHERE c.user_id = @userId AND c.type = 'RAGDOC'"
+        docs_ref = (
+            self._client.collection("users")
+            .document(user_id)
+            .collection("rag_documents")
         )
-        params = [{"name": "@userId", "value": user_id}]
-        items = list(self._container.query_items(
-            query=query,
-            parameters=params,
-            partition_key=f"_user_{user_id}",
-        ))
         
-        # Sort newest first
+        items = [doc.to_dict() for doc in docs_ref.get()]
         items.sort(
             key=lambda x: x.get("created_at", ""), reverse=True
         )

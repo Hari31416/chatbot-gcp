@@ -2,14 +2,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
-from azure.storage.blob import (
-    BlobServiceClient,
-    BlobSasPermissions,
-    ContentSettings,
-    generate_blob_sas,
-)
+from google.cloud import storage
 
 logger = logging.getLogger(__name__)
 
@@ -32,91 +27,103 @@ class UploadResult:
 
 
 class StorageService:
-    """Azure Blob Storage implementation replacing the S3 client."""
+    """Google Cloud Storage implementation replacing Azure Blob Storage."""
 
     def __init__(
         self,
-        connection_string: str,
-        container_name: str,
+        client: storage.Client,
+        bucket_name: str,
+        prefix: str,
+        signing_service_account: str | None = None,
     ) -> None:
-        self._service_client = BlobServiceClient.from_connection_string(connection_string)
-        self._container_name = container_name
-        self._container_client = self._service_client.get_container_client(container_name)
+        self._client = client
+        self._bucket_name = bucket_name
+        self.prefix = prefix.strip("/")
+        self._bucket = self._client.bucket(bucket_name)
+        
+        # Verify/ensure bucket exists or log a warning
         try:
-            self._container_client.get_container_properties()
-        except Exception:
-            try:
-                self._container_client.create_container()
-            except Exception:
-                logger.warning("Could not create container %s (might already exist or read-only)", container_name)
-        logger.info("StorageService initialised container=%s", container_name)
+            # We don't try to create bucket programmatically for production security,
+            # but we initialize the reference.
+            logger.info("StorageService initialised bucket=%s prefix=%s", bucket_name, prefix)
+        except Exception as exc:
+            logger.warning("Failed to verify GCS bucket: %s", exc)
+
+        self.signing_service_account = signing_service_account
+
+    def _blob_key(self, key: str) -> str:
+        clean_key = key.lstrip("/")
+        if self.prefix:
+            return f"{self.prefix}/{clean_key}"
+        return clean_key
 
     def upload_image(self, key: str, data: bytes, mime_type: str) -> UploadResult:
         logger.debug("Uploading image key=%s mime_type=%s size=%d", key, mime_type, len(data))
-        blob_client = self._container_client.get_blob_client(key)
-        blob_client.upload_blob(
-            data,
-            overwrite=True,
-            content_settings=ContentSettings(content_type=mime_type),
-        )
-        logger.info("Image uploaded key=%s size_bytes=%d", key, len(data))
+        blob_key = self._blob_key(key)
+        blob = self._bucket.blob(blob_key)
+        blob.upload_from_string(data, content_type=mime_type)
+        logger.info("Image uploaded key=%s size_bytes=%d", blob_key, len(data))
         return UploadResult(s3_key=key, mime_type=mime_type, size_bytes=len(data))
 
     def upload_bytes(self, key: str, data: bytes, mime_type: str) -> None:
         logger.debug("Uploading raw bytes key=%s mime_type=%s size=%d", key, mime_type, len(data))
-        blob_client = self._container_client.get_blob_client(key)
-        blob_client.upload_blob(
-            data,
-            overwrite=True,
-            content_settings=ContentSettings(content_type=mime_type),
-        )
-        logger.info("Raw bytes uploaded key=%s size_bytes=%d", key, len(data))
+        blob_key = self._blob_key(key)
+        blob = self._bucket.blob(blob_key)
+        blob.upload_from_string(data, content_type=mime_type)
+        logger.info("Raw bytes uploaded key=%s size_bytes=%d", blob_key, len(data))
 
     def download_bytes(self, key: str) -> tuple[bytes, str]:
         """Download blob and return (data, content_type)."""
-        blob_client = self._container_client.get_blob_client(key)
-        download = blob_client.download_blob()
-        data = download.readall()
-        content_type = download.properties.content_settings.content_type or "application/octet-stream"
+        blob_key = self._blob_key(key)
+        blob = self._bucket.blob(blob_key)
+        
+        # In GCS, we have to reload the blob metadata to get the content_type
+        blob.reload()
+        data = blob.download_as_bytes()
+        content_type = blob.content_type or "application/octet-stream"
         return data, content_type
 
     def delete_blob(self, key: str) -> None:
         """Delete a blob by key."""
-        blob_client = self._container_client.get_blob_client(key)
-        blob_client.delete_blob()
-        logger.info("Blob deleted key=%s", key)
+        blob_key = self._blob_key(key)
+        blob = self._bucket.blob(blob_key)
+        blob.delete()
+        logger.info("Blob deleted key=%s", blob_key)
 
     def generate_sas_url(self, key: str, expiration_seconds: int = 3600) -> str:
-        """Generate a SAS URL (replaces S3 presigned URL)."""
+        """Generate a GCS signed URL (equivalent to Azure SAS URL)."""
         try:
-            blob_client = self._container_client.get_blob_client(key)
-            account_name = self._service_client.account_name
-            # If standard devstoreaccount1 key is used, SAS token generation is done locally using standard credentials
-            account_key = None
-            if hasattr(self._service_client.credential, "account_key"):
-                account_key = self._service_client.credential.account_key
-            elif "AccountKey=" in self._service_client.url:
-                # Attempt to extract account key from connection string
-                pass
+            blob_key = self._blob_key(key)
+            blob = self._bucket.blob(blob_key)
 
-            # Fallback for local emulator or missing credential properties
-            if not account_key and account_name == "devstoreaccount1":
-                account_key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+            if self.signing_service_account:
+                import google.auth
+                from google.auth import impersonated_credentials
+                source_credentials, _ = google.auth.default()
+                signing_credentials = impersonated_credentials.Credentials(
+                    source_credentials=source_credentials,
+                    target_principal=self.signing_service_account,
+                    target_scopes=["https://www.googleapis.com/auth/devstorage.read_only"],
+                    lifetime=min(expiration_seconds, 3600),
+                )
+                return blob.generate_signed_url(
+                    version="v4",
+                    expiration=timedelta(seconds=expiration_seconds),
+                    method="GET",
+                    credentials=signing_credentials,
+                )
 
-            sas_token = generate_blob_sas(
-                account_name=account_name,
-                container_name=self._container_name,
-                blob_name=key,
-                account_key=account_key,
-                permission=BlobSasPermissions(read=True),
-                expiry=datetime.now(timezone.utc) + timedelta(seconds=expiration_seconds),
+            # Fallback to standard signed URL generation (requires private key or ADC credentials)
+            return blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(seconds=expiration_seconds),
+                method="GET",
             )
-            return f"{blob_client.url}?{sas_token}"
-        except Exception:
-            fallback = f"https://{self._service_client.account_name}.blob.core.windows.net/{self._container_name}/{key}"
+        except Exception as exc:
+            fallback = f"https://storage.googleapis.com/{self._bucket_name}/{self._blob_key(key)}"
             logger.warning(
-                "Failed to generate SAS URL key=%s; using fallback url=%s",
-                key, fallback, exc_info=True,
+                "Failed to generate GCS signed URL key=%s; using fallback url=%s. Error: %s",
+                key, fallback, exc,
             )
             return fallback
 
