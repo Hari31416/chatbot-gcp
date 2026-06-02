@@ -39,3 +39,10 @@ variable "notification_channel_id" {
   default     = ""
   description = "Optional notification channel ID for alerts"
 }
+
+variable "additional_env_vars" {
+  type        = map(string)
+  default     = {}
+  description = "Additional environment variables to pass to the container services"
+}
+

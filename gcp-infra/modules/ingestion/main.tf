@@ -3,6 +3,10 @@ variable "region" { type = string }
 variable "bucket_name" { type = string }
 variable "worker_image" { type = string }
 variable "secret_ids" { type = map(string) }
+variable "additional_env_vars" {
+  type    = map(string)
+  default = {}
+}
 
 resource "google_pubsub_topic" "ingestion" {
   name    = "chatbot-ingestion"
@@ -139,6 +143,15 @@ resource "google_cloud_run_v2_service" "worker" {
               version = "latest"
             }
           }
+        }
+      }
+
+      # Additional environment variables dynamically loaded from variables
+      dynamic "env" {
+        for_each = var.additional_env_vars
+        content {
+          name  = env.key
+          value = env.value
         }
       }
     }

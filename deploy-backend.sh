@@ -20,10 +20,43 @@ echo "🐳 Building FastAPI API container image via Cloud Build..."
 gcloud builds submit backend --tag "$IMAGE" --project "$GCP_PROJECT_ID"
 
 echo "🔄 Deploying via Terraform..."
+
+# Construct a JSON map of non-empty environment variables to pass to Terraform
+additional_env_vars="{"
+first=true
+
+add_var() {
+  local name="$1"
+  local val="${!name:-}"
+  if [ -n "$val" ]; then
+    if [ "$first" = false ]; then
+      additional_env_vars="${additional_env_vars},"
+    fi
+    additional_env_vars="${additional_env_vars}\"${name}\":\"${val}\""
+    first=false
+  fi
+}
+
+add_var "LITELLM_MODEL"
+add_var "LITELLM_VISION_MODEL"
+add_var "LITELLM_EMBEDDING_MODEL"
+add_var "EMBEDDING_DIMENSION"
+add_var "DOCUMENT_AI_LOCATION"
+add_var "DOCUMENT_AI_PROCESSOR_ID"
+add_var "DOCUMENT_AI_USE_LAYOUT_PARSER"
+add_var "MAX_RAG_PAGES"
+add_var "MAX_RAG_CHUNKS"
+add_var "RAG_TOP_K"
+add_var "RAG_CHUNK_SIZE"
+add_var "RAG_CHUNK_OVERLAP"
+
+additional_env_vars="${additional_env_vars}}"
+
 terraform -chdir=gcp-infra apply \
   -var="project_id=${GCP_PROJECT_ID}" \
   -var="region=${GCP_REGION}" \
   -var="api_image=${IMAGE}" \
+  -var="additional_env_vars=${additional_env_vars}" \
   -auto-approve
 
 echo "🎉 Backend deployment complete!"

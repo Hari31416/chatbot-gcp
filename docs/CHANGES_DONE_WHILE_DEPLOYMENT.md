@@ -47,6 +47,9 @@ We set `deletion_protection = false` on both `google_cloud_run_v2_service` resou
 ### Solution D: Collection Group Index Exemption (The Firestore Module)
 We updated the Firestore module to automatically configure a single-field index exemption for the `conversation_id` field within the `conversations` collection group scope. This ensures that any queries spanning multiple users' conversations (which are stored as subcollections under `/users/{user_id}/conversations`) can query across the entire collection group without failing.
 
+### Solution E: Dynamic Environment Variables Passing (The Cloud Run, Ingestion, and Deploy Modules)
+We updated the Terraform modules and deployment scripts to dynamically compile all active `.env` configuration keys (e.g. `LITELLM_MODEL`, `LITELLM_VISION_MODEL`, etc.) at deploy-time. These are passed as a JSON-encoded map (`additional_env_vars`) to Terraform, which dynamically mounts them on the Cloud Run and Ingestion Worker containers. This ensures the backend containers run with the correct production configurations and prevents them from falling back to hardcoded defaults (like `gpt-4o-mini`).
+
 ---
 
 ## 4. Firestore Collection Group Index Exemption
@@ -99,7 +102,28 @@ We resolved this comprehensively in two ways to ensure both immediate resolution
 
 ---
 
-## 5. Detailed File Diffs
+## 5. Model Configuration / 401 Authentication Failure
+
+### The Error
+```text
+openai.AuthenticationError: Error code: 401 - {'error': {'message': 'Your authentication token is not from a valid issuer.', 'type': 'invalid_request_error', 'code': 'invalid_issuer'}}
+```
+
+### Root Cause
+While your local `.env` specifies a custom model endpoint token and configurations:
+* `LITELLM_MODEL=openai/gpt_oss_120b`
+* `LITELLM_API_KEY=eyJhbGciOiJSUzI1NiIsInR5cCIg...`
+
+Terraform was not configuring or passing these model variables to the deployed Cloud Run services. As a result, the FastAPI container defaulted to `gpt-4o-mini` (per Pydantic setting fallbacks). When the application attempted to stream the LLM response, it sent your custom API token to the standard OpenAI endpoint, which failed with a `401 Unauthorized` token error.
+
+### Implemented Solution
+We declared a generic `additional_env_vars` map variable inside Terraform (`gcp-infra/variables.tf` and the modules). We then:
+1. Updated [deploy-backend.sh](file:///Users/hari/Desktop/sandbox/chatbot-gcp/deploy-backend.sh) and [deploy-worker.sh](file:///Users/hari/Desktop/sandbox/chatbot-gcp/deploy-worker.sh) to automatically compile all active `.env` configuration keys into a JSON map at deploy time.
+2. Passed this JSON map to Terraform, which dynamically injects them as environment variables into both container definitions. This correctly overrides all default model configurations in production.
+
+---
+
+## 6. Detailed File Diffs
 
 ### A. [gcp-infra/modules/secrets/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/secrets/main.tf)
 Added a `google_secret_manager_secret_version` resource to bootstrap default values:
@@ -181,18 +205,68 @@ resource "google_firestore_field" "conversation_id_index" {
 }
 ```
 
+### E. [deploy-backend.sh](file:///Users/hari/Desktop/sandbox/chatbot-gcp/deploy-backend.sh) & [deploy-worker.sh](file:///Users/hari/Desktop/sandbox/chatbot-gcp/deploy-worker.sh)
+Added JSON environment variable compilation and passed them to the `terraform apply` CLI command:
+
+```bash
+# Construct a JSON map of non-empty environment variables to pass to Terraform
+additional_env_vars="{"
+first=true
+
+add_var() {
+  local name="$1"
+  local val="${!name:-}"
+  if [ -n "$val" ]; then
+    if [ "$first" = false ]; then
+      additional_env_vars="${additional_env_vars},"
+    fi
+    additional_env_vars="${additional_env_vars}\"${name}\":\"${val}\""
+    first=false
+  fi
+}
+
+add_var "LITELLM_MODEL"
+add_var "LITELLM_VISION_MODEL"
+add_var "LITELLM_EMBEDDING_MODEL"
+add_var "EMBEDDING_DIMENSION"
+add_var "DOCUMENT_AI_LOCATION"
+add_var "DOCUMENT_AI_PROCESSOR_ID"
+add_var "DOCUMENT_AI_USE_LAYOUT_PARSER"
+# ...
+
+terraform -chdir=gcp-infra apply \
+  ...
+  -var="additional_env_vars=${additional_env_vars}" \
+  -auto-approve
+```
+
+### F. [gcp-infra/modules/cloud-run/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/cloud-run/main.tf) & [gcp-infra/modules/ingestion/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/ingestion/main.tf)
+Added `additional_env_vars` input map and dynamic block to inject variables into Cloud Run container configurations:
+
+```hcl
+variable "additional_env_vars" {
+  type    = map(string)
+  default = {}
+}
+
+# Inside resource "google_cloud_run_v2_service" -> containers:
+      # Additional environment variables dynamically loaded from variables
+      dynamic "env" {
+        for_each = var.additional_env_vars
+        content {
+          name  = env.key
+          value = env.value
+        }
+      }
+```
+
 ---
 
-## 6. Verification and Next Steps
+## 7. Verification and Next Steps
 
-1. Run the base infrastructure apply command:
+1. To apply the new model variables, redeploy the FastAPI backend and RAG Ingestion worker services:
    ```bash
-   make deploy-infra
+   ./deploy-backend.sh
+   ./deploy-worker.sh
    ```
-2. Overwrite the dummy values in GCP Secret Manager with your active credentials:
-   ```bash
-   echo -n "YOUR_LITELLM_API_KEY" | gcloud secrets versions add litellm-api-key --data-file=- --project=rag-chatbot-hari31416
-   echo -n "YOUR_LITELLM_VISION_API_KEY" | gcloud secrets versions add litellm-vision-api-key --data-file=- --project=rag-chatbot-hari31416
-   echo -n "YOUR_LITELLM_EMBEDDING_API_KEY" | gcloud secrets versions add litellm-embedding-api-key --data-file=- --project=rag-chatbot-hari31416
-   ```
-3. Proceed with RAG container services deployment as documented in [docs/GCP_DEPLOYMENT_GUIDE.md](file:///Users/hari/Desktop/sandbox/chatbot-gcp/docs/GCP_DEPLOYMENT_GUIDE.md).
+2. Verify that the stream generation error goes away and chat works correctly.

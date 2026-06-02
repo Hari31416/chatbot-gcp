@@ -50,23 +50,25 @@ module "secrets" {
 }
 
 module "cloud_run" {
-  source      = "./modules/cloud-run"
-  project_id  = var.project_id
-  region      = var.region
-  api_image   = var.api_image
-  bucket_name = module.storage.bucket_name
-  secret_ids  = module.secrets.secret_ids
+  source              = "./modules/cloud-run"
+  project_id          = var.project_id
+  region              = var.region
+  api_image           = var.api_image
+  bucket_name         = module.storage.bucket_name
+  secret_ids          = module.secrets.secret_ids
+  additional_env_vars = var.additional_env_vars
 
   depends_on = [google_project_service.required]
 }
 
 module "ingestion" {
-  source       = "./modules/ingestion"
-  project_id   = var.project_id
-  region       = var.region
-  bucket_name  = module.storage.bucket_name
-  worker_image = var.worker_image
-  secret_ids   = module.secrets.secret_ids
+  source              = "./modules/ingestion"
+  project_id          = var.project_id
+  region              = var.region
+  bucket_name         = module.storage.bucket_name
+  worker_image        = var.worker_image
+  secret_ids          = module.secrets.secret_ids
+  additional_env_vars = var.additional_env_vars
 
   depends_on = [google_project_service.required]
 }
