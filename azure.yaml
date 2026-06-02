@@ -1,0 +1,20 @@
+# azure.yaml
+name: chatbot-azure
+metadata:
+  template: chatbot-azure
+
+services:
+  backend:
+    project: ./backend
+    host: containerapp
+    language: python
+
+  worker:
+    project: ./backend
+    host: function
+    language: python
+
+  frontend:
+    project: ./frontend
+    host: staticwebapp
+    language: js

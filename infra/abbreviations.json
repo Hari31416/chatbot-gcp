@@ -1,0 +1,11 @@
+{
+  "resourceGroup": "rg-",
+  "storageAccount": "st",
+  "cosmosAccount": "cosmos-",
+  "keyVault": "kv-",
+  "containerApp": "ca-",
+  "containerAppEnv": "cae-",
+  "staticWebApp": "swa-",
+  "logAnalytics": "log-",
+  "appInsights": "appi-"
+}
