@@ -9,6 +9,13 @@ if [ -f .env ]; then
   set +a
 fi
 
+echo "========================================="
+echo "📦 Exporting backend requirements..."
+echo "========================================="
+cd backend
+uv export --format requirements-txt --no-hashes --no-emit-project -o requirements.txt
+cd ..
+
 export GCP_REGION="${GCP_REGION:-asia-south1}"
 export IMAGE_TAG="$(git rev-parse --short HEAD 2>/dev/null || echo latest)"
 if ! git diff --quiet HEAD 2>/dev/null; then

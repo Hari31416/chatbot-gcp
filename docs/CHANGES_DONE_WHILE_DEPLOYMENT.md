@@ -123,7 +123,25 @@ We declared a generic `additional_env_vars` map variable inside Terraform (`gcp-
 
 ---
 
-## 6. Detailed File Diffs
+## 6. Cloud Build Registry Timeout (ghcr.io/astral-sh/uv:latest)
+
+### The Error
+```text
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+invalid from flag value ghcr.io/astral-sh/uv:latest: Head "https://ghcr.io/v2/astral-sh/uv/manifests/latest": Client.Timeout exceeded while awaiting headers
+```
+
+### Root Cause
+During remote container image building on GCP Cloud Build, pulling the `uv` package manager binary from the GitHub Container Registry (`ghcr.io`) can trigger transient network/DNS timeouts, leading to a build block and complete failure.
+
+### Implemented Solution
+We completely removed any compile-time dependency on `ghcr.io/astral-sh/uv` inside the container:
+1. **Dynamic Requirements Export:** We updated the deployment scripts (`deploy-backend.sh` and `deploy-worker.sh`) to automatically run `uv export` locally at start time. This dynamically outputs the current, pinned virtual environment dependencies into a standard `requirements.txt` in the `backend/` directory.
+2. **Standard Pip Installation:** We updated both `backend/Dockerfile` and `backend/Dockerfile.worker` to copy `requirements.txt` and run `pip install --no-cache-dir -r requirements.txt` on the official `python:3.12-slim` image, completely bypassing ghcr.io and ensuring robust, reliable, and fast remote builds.
+
+---
+
+## 7. Detailed File Diffs
 
 ### A. [gcp-infra/modules/secrets/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/secrets/main.tf)
 Added a `google_secret_manager_secret_version` resource to bootstrap default values:
@@ -206,33 +224,17 @@ resource "google_firestore_field" "conversation_id_index" {
 ```
 
 ### E. [deploy-backend.sh](file:///Users/hari/Desktop/sandbox/chatbot-gcp/deploy-backend.sh) & [deploy-worker.sh](file:///Users/hari/Desktop/sandbox/chatbot-gcp/deploy-worker.sh)
-Added JSON environment variable compilation and passed them to the `terraform apply` CLI command:
+Added JSON environment variable compilation, dynamic local requirements export, and passed additional variables to the `terraform apply` CLI command:
 
 ```bash
+# Export requirements dynamically
+echo "📦 Exporting backend requirements..."
+cd backend
+uv export --format requirements-txt --no-hashes --no-emit-project -o requirements.txt
+cd ..
+
 # Construct a JSON map of non-empty environment variables to pass to Terraform
-additional_env_vars="{"
-first=true
-
-add_var() {
-  local name="$1"
-  local val="${!name:-}"
-  if [ -n "$val" ]; then
-    if [ "$first" = false ]; then
-      additional_env_vars="${additional_env_vars},"
-    fi
-    additional_env_vars="${additional_env_vars}\"${name}\":\"${val}\""
-    first=false
-  fi
-}
-
-add_var "LITELLM_MODEL"
-add_var "LITELLM_VISION_MODEL"
-add_var "LITELLM_EMBEDDING_MODEL"
-add_var "EMBEDDING_DIMENSION"
-add_var "DOCUMENT_AI_LOCATION"
-add_var "DOCUMENT_AI_PROCESSOR_ID"
-add_var "DOCUMENT_AI_USE_LAYOUT_PARSER"
-# ...
+additional_env_vars="..."
 
 terraform -chdir=gcp-infra apply \
   ...
@@ -260,13 +262,37 @@ variable "additional_env_vars" {
       }
 ```
 
+### G. [backend/Dockerfile](file:///Users/hari/Desktop/sandbox/chatbot-gcp/backend/Dockerfile) & [backend/Dockerfile.worker](file:///Users/hari/Desktop/sandbox/chatbot-gcp/backend/Dockerfile.worker)
+Converted the Docker image package resolution from `uv` to standard `pip` using the exported `requirements.txt`:
+
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Copy dependency files
+COPY requirements.txt ./
+
+# Install dependencies using pip
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY app/ ./app/
+
+# Expose default Cloud Run port
+EXPOSE 8080
+
+# Use standard python to run uvicorn
+CMD ["/bin/sh", "-c", "python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+```
+
 ---
 
-## 7. Verification and Next Steps
+## 8. Verification and Next Steps
 
-1. To apply the new model variables, redeploy the FastAPI backend and RAG Ingestion worker services:
+1. To apply all fixes (both index exemptions, custom model settings, and ghcr.io bypasses), deploy the FastAPI backend and RAG Ingestion worker services:
    ```bash
    ./deploy-backend.sh
    ./deploy-worker.sh
    ```
-2. Verify that the stream generation error goes away and chat works correctly.
+2. Verify that the build succeeds without timing out, and chat streams successfully without any errors!
