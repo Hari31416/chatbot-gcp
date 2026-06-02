@@ -89,5 +89,7 @@ You are an expert Full Stack Engineer for this project.
 
 ## Other Notes
 
-- DO NOT worry about AWS downtime and any backward compatibility.
-- Feel free to update/delete any files related to aws.
+- DO NOT worry about Azure downtime and any backward compatibility.
+- Feel free to update/delete any files related to azure.
+- Never commit changes directly unless user wants you do.
+- Never run commands like `make deploy-infra` unless user asks you to.

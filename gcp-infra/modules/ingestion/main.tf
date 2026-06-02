@@ -68,9 +68,16 @@ resource "google_project_iam_member" "eventarc_receiver" {
 }
 
 resource "google_cloud_run_v2_service" "worker" {
-  name     = "chatbot-worker"
-  location = var.region
-  project  = var.project_id
+  name                = "chatbot-worker"
+  location            = var.region
+  project             = var.project_id
+  deletion_protection = false
+
+  depends_on = [
+    google_project_iam_member.worker_firestore,
+    google_storage_bucket_iam_member.worker_storage,
+    google_project_iam_member.worker_secrets,
+  ]
 
   template {
     service_account = google_service_account.worker.email

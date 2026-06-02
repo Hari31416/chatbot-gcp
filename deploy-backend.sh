@@ -1,6 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
+# Load environment variables from .env if present (for direct script invocation)
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
 export GCP_REGION="${GCP_REGION:-asia-south1}"
 export IMAGE_TAG="$(git rev-parse --short HEAD 2>/dev/null || echo latest)"
 export IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID:?GCP_PROJECT_ID is required}/chatbot/api:${IMAGE_TAG}"

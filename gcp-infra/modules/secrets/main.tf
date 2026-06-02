@@ -18,6 +18,13 @@ resource "google_secret_manager_secret" "app" {
   }
 }
 
+resource "google_secret_manager_secret_version" "app" {
+  for_each    = var.secret_ids
+  secret      = google_secret_manager_secret.app[each.value].id
+  secret_data = "placeholder-replace-me"
+}
+
 output "secret_ids" {
   value = { for key, secret in google_secret_manager_secret.app : key => secret.secret_id }
 }
+

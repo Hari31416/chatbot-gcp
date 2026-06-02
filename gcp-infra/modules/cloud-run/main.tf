@@ -35,9 +35,17 @@ resource "google_project_iam_member" "api_secrets" {
 }
 
 resource "google_cloud_run_v2_service" "api" {
-  name     = "chatbot-api"
-  location = var.region
-  project  = var.project_id
+  name                = "chatbot-api"
+  location            = var.region
+  project             = var.project_id
+  deletion_protection = false
+
+  depends_on = [
+    google_service_account_iam_member.api_can_sign_as_self,
+    google_project_iam_member.api_firestore,
+    google_storage_bucket_iam_member.api_storage,
+    google_project_iam_member.api_secrets,
+  ]
 
   template {
     service_account = google_service_account.api.email
