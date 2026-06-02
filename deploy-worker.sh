@@ -60,10 +60,20 @@ add_var "RAG_CHUNK_OVERLAP"
 
 additional_env_vars="${additional_env_vars}}"
 
+# Query the currently deployed api image to prevent Terraform from resetting it to the default placeholder
+CURRENT_API_IMAGE=$(gcloud run services describe chatbot-api --region="$GCP_REGION" --project="$GCP_PROJECT_ID" --format="value(spec.template.spec.containers[0].image)" 2>/dev/null || echo "")
+if [ -n "$CURRENT_API_IMAGE" ]; then
+  echo "Found currently deployed API image: $CURRENT_API_IMAGE"
+  API_IMAGE_ARG="-var=api_image=$CURRENT_API_IMAGE"
+else
+  API_IMAGE_ARG=""
+fi
+
 terraform -chdir=gcp-infra apply \
   -var="project_id=${GCP_PROJECT_ID}" \
   -var="region=${GCP_REGION}" \
   -var="worker_image=${WORKER_IMAGE}" \
+  ${API_IMAGE_ARG} \
   -var="additional_env_vars=${additional_env_vars}" \
   -auto-approve
 

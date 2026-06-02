@@ -10,8 +10,6 @@ interface SidebarProps {
   handleCreateConversation: () => void;
   handleDeleteConversation: (id: string, e: React.MouseEvent) => void;
   userId: string;
-  theme: string;
-  setTheme: (theme: "light" | "dark") => void;
   handleLogout: () => void;
   onOpenDocuments?: () => void;
 }
@@ -25,8 +23,6 @@ export function Sidebar({
   handleCreateConversation,
   handleDeleteConversation,
   userId,
-  theme,
-  setTheme,
   handleLogout,
   onOpenDocuments,
 }: SidebarProps) {
@@ -147,13 +143,7 @@ export function Sidebar({
             </div>
           </div>
 
-          <div className="flex justify-between items-center text-xs text-zinc-550 dark:text-zinc-300 px-1 pt-1 border-t border-zinc-200/50 dark:border-zinc-800/50">
-            <button
-              onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-              className="hover:text-zinc-750 dark:hover:text-zinc-100 cursor-pointer"
-            >
-              {theme === "dark" ? "☀️ Light" : "🌙 Dark"}
-            </button>
+          <div className="flex justify-end items-center text-xs text-zinc-550 dark:text-zinc-300 px-1 pt-1 border-t border-zinc-200/50 dark:border-zinc-800/50">
             <button
               onClick={handleLogout}
               className="text-red-500 hover:text-red-750 font-semibold cursor-pointer"

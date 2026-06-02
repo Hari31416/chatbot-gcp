@@ -60,10 +60,20 @@ add_var "RAG_CHUNK_OVERLAP"
 
 additional_env_vars="${additional_env_vars}}"
 
+# Query the currently deployed worker image to prevent Terraform from resetting it to the default placeholder
+CURRENT_WORKER_IMAGE=$(gcloud run services describe chatbot-worker --region="$GCP_REGION" --project="$GCP_PROJECT_ID" --format="value(spec.template.spec.containers[0].image)" 2>/dev/null || echo "")
+if [ -n "$CURRENT_WORKER_IMAGE" ]; then
+  echo "Found currently deployed worker image: $CURRENT_WORKER_IMAGE"
+  WORKER_IMAGE_ARG="-var=worker_image=$CURRENT_WORKER_IMAGE"
+else
+  WORKER_IMAGE_ARG=""
+fi
+
 terraform -chdir=gcp-infra apply \
   -var="project_id=${GCP_PROJECT_ID}" \
   -var="region=${GCP_REGION}" \
   -var="api_image=${IMAGE}" \
+  ${WORKER_IMAGE_ARG} \
   -var="additional_env_vars=${additional_env_vars}" \
   -auto-approve
 

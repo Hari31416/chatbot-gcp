@@ -12,7 +12,6 @@ import {
   fetchRagDocuments,
 } from "./services/api";
 import { useToast } from "@/components/ui/Toast";
-import { useTheme } from "@/components/theme-provider";
 import { onAuthStateChanged, signOut as firebaseSignOut } from "firebase/auth";
 import { auth } from "./services/firebase";
 import { getCurrentSessionToken } from "./services/auth";
@@ -25,7 +24,6 @@ import { DocumentsModal } from "./components/DocumentsModal";
 
 export function App() {
   const { toast } = useToast();
-  const { theme, setTheme } = useTheme();
 
   // --- Authentication State ---
   const [isLoggedIn, setIsLoggedIn] = React.useState(false);
@@ -641,8 +639,6 @@ export function App() {
         handleCreateConversation={handleCreateConversation}
         handleDeleteConversation={handleDeleteConversation}
         userId={userId}
-        theme={theme}
-        setTheme={setTheme as any}
         handleLogout={handleLogout}
         onOpenDocuments={() => setIsDocumentsOpen(true)}
       />
