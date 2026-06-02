@@ -44,9 +44,62 @@ We added explicit `depends_on` blocks to both the public API Cloud Run service (
 ### Solution C: Disable Deletion Protection (The Cloud Run & Ingestion Modules)
 We set `deletion_protection = false` on both `google_cloud_run_v2_service` resources. Without this flag, Terraform cannot delete or recreate Cloud Run services (e.g. when resource configuration changes force a replacement). This is the correct pattern for Terraform-managed services where the IaC toolchain itself owns the lifecycle of the resource.
 
+### Solution D: Collection Group Index Exemption (The Firestore Module)
+We updated the Firestore module to automatically configure a single-field index exemption for the `conversation_id` field within the `conversations` collection group scope. This ensures that any queries spanning multiple users' conversations (which are stored as subcollections under `/users/{user_id}/conversations`) can query across the entire collection group without failing.
+
 ---
 
-## 4. Detailed File Diffs
+## 4. Firestore Collection Group Index Exemption
+
+### The Error
+```text
+Failed: 400 The query requires a COLLECTION_GROUP_ASC index for collection conversations and field conversation_id. You can create it here:
+```
+
+### Root Cause
+The persistence layer retrieves chat messages or validates conversation metadata using Firestore Collection Group queries:
+```python
+self._client.collection_group("conversations").where("conversation_id", "==", conversation_id).limit(1).get()
+```
+Because the `conversations` subcollections reside under individual user documents, a query across all user subcollections is a collection group query. Firestore requires an explicit single-field index exemption with a `COLLECTION_GROUP` query scope enabled for the filtered field (`conversation_id`). Without it, Firestore rejects the query with a 400 error.
+
+### Implemented Solution
+We resolved this comprehensively in two ways to ensure both immediate resolution and future reproducibility:
+
+1. **Declarative Firebase CLI Index Deployment (Recommended & Instant):**
+   We created a `firestore.indexes.json` file inside the `frontend` directory and registered the single-field index exemption with the `COLLECTION_GROUP` query scope:
+   ```json
+   {
+     "indexes": [],
+     "fieldOverrides": [
+       {
+         "collectionGroup": "conversations",
+         "fieldPath": "conversation_id",
+         "indexes": [
+           {
+             "order": "ASCENDING",
+             "queryScope": "COLLECTION_GROUP"
+           },
+           {
+             "order": "DESCENDING",
+             "queryScope": "COLLECTION_GROUP"
+           }
+         ]
+       }
+     ]
+   }
+   ```
+   We then updated `frontend/firebase.json` to configure the `firestore` property pointing to this file. Finally, we deployed these index overrides using the Firebase CLI to instantly configure the correct collection group index scope on GCP:
+   ```bash
+   firebase deploy --only firestore:indexes --project=rag-chatbot-hari31416
+   ```
+
+2. **Infrastructure as Code (IaC) Setup:**
+   We declared a `google_firestore_field` resource in Terraform for `conversation_id` on the `conversations` collection group, setting the `query_scope` to `COLLECTION_GROUP` for both `ASCENDING` and `DESCENDING` index orders inside `gcp-infra/modules/firestore/main.tf` to ensure it is automatically provisioned for future automated environments.
+
+---
+
+## 5. Detailed File Diffs
 
 ### A. [gcp-infra/modules/secrets/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/secrets/main.tf)
 Added a `google_secret_manager_secret_version` resource to bootstrap default values:
@@ -105,9 +158,32 @@ resource "google_cloud_run_v2_service" "worker" {
 }
 ```
 
+### D. [gcp-infra/modules/firestore/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/firestore/main.tf)
+Added `google_firestore_field` to automatically establish the required collection group index exemption for the persistence layer:
+
+```hcl
+resource "google_firestore_field" "conversation_id_index" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "conversations"
+  field      = "conversation_id"
+
+  index_config {
+    indexes {
+      order       = "ASCENDING"
+      query_scope = "COLLECTION_GROUP"
+    }
+    indexes {
+      order       = "DESCENDING"
+      query_scope = "COLLECTION_GROUP"
+    }
+  }
+}
+```
+
 ---
 
-## 5. Verification and Next Steps
+## 6. Verification and Next Steps
 
 1. Run the base infrastructure apply command:
    ```bash

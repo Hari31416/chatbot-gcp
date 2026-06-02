@@ -6,7 +6,7 @@ cd frontend
 pnpm install --frozen-lockfile
 pnpm build
 
-echo "Deploying to Firebase Hosting..."
-firebase deploy --only hosting --project "${GCP_PROJECT_ID:?GCP_PROJECT_ID is required}"
+echo "Deploying to Firebase Hosting and Firestore Indexes..."
+firebase deploy --only hosting,firestore:indexes --project "${GCP_PROJECT_ID:?GCP_PROJECT_ID is required}"
 
 echo "Frontend deployment complete!"

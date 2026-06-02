@@ -157,7 +157,7 @@ VITE_FIREBASE_PROJECT_ID=YOUR_PROJECT_ID
 VITE_FIREBASE_APP_ID=YOUR_FIREBASE_APP_ID
 ```
 
-Compile React assets and deploy to Firebase Hosting:
+Compile React assets and deploy them to Firebase Hosting (this also automatically deploys the required Firestore collection group index overrides):
 ```bash
 ./deploy-frontend.sh
 ```
