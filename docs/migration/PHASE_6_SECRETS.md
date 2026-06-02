@@ -1,243 +1,128 @@
-# Phase 6 — Secrets Management Migration
+# Phase 6 — Secret Manager Migration
 
-> Replace AWS SSM Parameter Store with Azure Key Vault for storing API keys and sensitive configuration.
+> Replace Azure Key Vault runtime reads with Google Secret Manager and Cloud Run secret mounts.
 
 ---
 
 ## Goal
 
-Move all secret retrieval from SSM `get_parameter(WithDecryption=True)` to Azure Key Vault secret references, accessed via Managed Identity (passwordless) in production and connection string in local dev.
+Store third-party API keys in Secret Manager. Prefer Cloud Run secret injection over fetching secrets inside request handlers.
 
 ---
 
-## Current State (AWS)
+## Current State (Azure)
 
-### SSM Parameters Used
+`backend/app/dependencies.py` creates an Azure `SecretClient` and retrieves Key Vault values such as:
 
-| Parameter Path                    | Purpose                           | Consumed By                                     |
-| :-------------------------------- | :-------------------------------- | :---------------------------------------------- |
-| `/chatbot/litellm_api_key`        | LiteLLM text model API key        | `get_llm_client()`                              |
-| `/chatbot/litellm_vision_api_key` | Gemini vision + embedding API key | `get_vision_llm_client()`, `get_vector_store()` |
-
-### Code Path
-
-```python
-# app/dependencies.py
-def get_ssm_parameter(param_name: str) -> str | None:
-    ssm = boto3.client("ssm", region_name=get_settings().aws_region)
-    response = ssm.get_parameter(Name=param_name, WithDecryption=True)
-    return response["Parameter"]["Value"]
-```
-
-Environment variables `LITELLM_API_KEY_PARAMETER` and `LITELLM_VISION_API_KEY_PARAMETER` contain the SSM parameter names. The code tries SSM first, falling back to direct env vars.
+- `litellm-api-key`
+- `litellm-vision-api-key`
+- `clerk-secret-key`
+- `cosmos-key`
+- `storage-connection-string`
+- Document Intelligence endpoint and key
 
 ---
 
-## Target State (Azure)
+## Target State (GCP)
 
-### Azure Key Vault Secrets
+Only third-party credentials remain secrets:
 
-| Secret Name              | Maps to SSM Parameter             | Purpose                           |
-| :----------------------- | :-------------------------------- | :-------------------------------- |
-| `litellm-api-key`        | `/chatbot/litellm_api_key`        | LiteLLM text model API key        |
-| `litellm-vision-api-key` | `/chatbot/litellm_vision_api_key` | Gemini vision + embedding API key |
+| Secret                      | Purpose                         |
+| :-------------------------- | :------------------------------ |
+| `litellm-api-key`           | Text model gateway              |
+| `litellm-vision-api-key`    | Vision model gateway            |
+| `litellm-embedding-api-key` | Embedding endpoint, if separate |
 
-### Access Patterns
-
-| Environment                                 | Auth Method                                     |
-| :------------------------------------------ | :---------------------------------------------- |
-| **Production** (Container Apps / Functions) | System-assigned Managed Identity (passwordless) |
-| **Local Development**                       | `az login` credential (DefaultAzureCredential)  |
+Firestore, GCS, Document AI, and Firebase Admin use ADC with service-account IAM. Do not create cloud database passwords or service-account key files.
 
 ---
 
 ## Code Changes
 
-### 6.1 Add Azure Identity SDK
+### 6.1 Remove Azure Key Vault SDK
 
 ```diff
- dependencies = [
-   ...
-   "azure-cosmos>=4.7.0",
-   "azure-ai-documentintelligence>=1.0.0",
-+  "azure-identity>=1.17.0",
-+  "azure-keyvault-secrets>=4.8.0",
-   ...
- ]
+-  "azure-identity>=1.17.0",
+-  "azure-keyvault-secrets>=4.8.0",
 ```
 
-### 6.2 Update `app/settings.py`
+### 6.2 Remove Runtime Vault Reads
+
+Delete `get_keyvault_client()` and `get_secret()` from `backend/app/dependencies.py`. Read secrets from environment variables already supported by `Settings`:
 
 ```python
-# ── Azure Key Vault (Phase 6) ──
-azure_keyvault_name: str | None = Field(
-    default=None, validation_alias="AZURE_KEYVAULT_NAME"
-)
-```
-
-### 6.3 Replace `get_ssm_parameter()` in `app/dependencies.py`
-
-```python
-from azure.identity import DefaultAzureCredential
-from azure.keyvault.secrets import SecretClient
-
-@lru_cache
-def get_keyvault_client() -> SecretClient | None:
+def get_llm_client() -> LlmClient:
     settings = get_settings()
-    if not settings.azure_keyvault_name:
-        return None
-    vault_url = f"https://{settings.azure_keyvault_name}.vault.azure.net"
-    credential = DefaultAzureCredential()
-    return SecretClient(vault_url=vault_url, credential=credential)
-
-
-@lru_cache
-def get_secret(secret_name: str) -> str | None:
-    """Retrieve a secret from Azure Key Vault (replaces get_ssm_parameter)."""
-    client = get_keyvault_client()
-    if not client:
-        return None
-    try:
-        secret = client.get_secret(secret_name)
-        return secret.value
-    except Exception:
-        logger.warning("Failed to retrieve secret: %s", secret_name, exc_info=True)
-        return None
+    return LlmClient(
+        model=settings.litellm_model,
+        api_key=settings.litellm_api_key,
+        base_url=settings.litellm_base_url,
+    )
 ```
 
-### 6.4 Update LLM Client Factories
-
-```diff
- def get_llm_client() -> LlmClient:
-     settings = get_settings()
-     api_key = settings.litellm_api_key
--
--    ssm_param_name = os.getenv("LITELLM_API_KEY_PARAMETER")
--    if ssm_param_name:
--        ssm_key = get_ssm_parameter(ssm_param_name)
--        if ssm_key:
--            api_key = ssm_key
-+
-+    vault_key = get_secret("litellm-api-key")
-+    if vault_key:
-+        api_key = vault_key
-
-     return LlmClient(
-         model=settings.litellm_model,
-         api_key=api_key,
-         base_url=settings.litellm_base_url,
-     )
-```
-
-Apply the same pattern to `get_vision_llm_client()` and `get_vector_store()`.
-
-### 6.5 Remove SSM-related Code
-
-- Delete `get_ssm_parameter()` function
-- Remove `import boto3` from `dependencies.py` (if no other boto3 usage remains)
-- Remove env vars: `LITELLM_API_KEY_PARAMETER`, `LITELLM_VISION_API_KEY_PARAMETER`, `LITELLM_EMBEDDING_API_KEY_PARAMETER`
+Cloud Run resolves Secret Manager values into environment variables when a revision starts. This avoids secret-manager network calls on user requests.
 
 ---
 
-## Bicep Module: `infra/modules/keyvault.bicep`
+## Terraform Module
 
-```bicep
-param location string
-param environmentName string
-param containerAppPrincipalId string = ''
-param functionAppPrincipalId string = ''
+Create `gcp-infra/modules/secrets/main.tf`:
 
-resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
-  name: 'kv-chatbot-${environmentName}'
-  location: location
-  tags: { 'azd-env-name': environmentName }
-  properties: {
-    sku: { family: 'A', name: 'standard' }
-    tenantId: subscription().tenantId
-    enableRbacAuthorization: true
-    enableSoftDelete: true
-    softDeleteRetentionInDays: 7
+```hcl
+variable "project_id" { type = string }
+variable "secret_ids" { type = set(string) }
+
+resource "google_secret_manager_secret" "app" {
+  for_each  = var.secret_ids
+  secret_id = each.value
+
+  replication {
+    auto {}
   }
 }
 
-// Grant Key Vault Secrets User role to Container App managed identity
-resource acrRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (containerAppPrincipalId != '') {
-  name: guid(keyVault.id, containerAppPrincipalId, 'KeyVaultSecretsUser')
-  scope: keyVault
-  properties: {
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      '4633458b-17de-408a-b874-0445c86b69e6' // Key Vault Secrets User
-    )
-    principalId: containerAppPrincipalId
-    principalType: 'ServicePrincipal'
-  }
+output "secret_ids" {
+  value = { for key, secret in google_secret_manager_secret.app : key => secret.secret_id }
 }
-
-// Grant same role to Function App managed identity
-resource funcRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (functionAppPrincipalId != '') {
-  name: guid(keyVault.id, functionAppPrincipalId, 'KeyVaultSecretsUser')
-  scope: keyVault
-  properties: {
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      '4633458b-17de-408a-b874-0445c86b69e6'
-    )
-    principalId: functionAppPrincipalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-output keyVaultName string = keyVault.name
-output keyVaultUri string = keyVault.properties.vaultUri
 ```
 
----
-
-## Populating Secrets
-
-After provisioning, add secrets via CLI:
+Add secret values manually after provisioning:
 
 ```bash
-az keyvault secret set \
-  --vault-name kv-chatbot-dev \
-  --name litellm-api-key \
-  --value "your-api-key-here"
-
-az keyvault secret set \
-  --vault-name kv-chatbot-dev \
-  --name litellm-vision-api-key \
-  --value "your-vision-key-here"
+printf '%s' "$LITELLM_API_KEY" |
+  gcloud secrets versions add litellm-api-key --data-file=-
 ```
+
+Do not pass actual secret values through Terraform variables or state.
 
 ---
 
-## Local Development
+## IAM
 
-`DefaultAzureCredential` automatically picks up your `az login` session for local development. No special emulator needed.
+Grant `roles/secretmanager.secretAccessor` only to:
 
-```bash
-# Ensure you're logged in
-az login
+- `chatbot-api` Cloud Run service account
+- `chatbot-worker` Cloud Run service account
 
-# Set the Key Vault name in your .env
-AZURE_KEYVAULT_NAME=kv-chatbot-dev
-```
+---
+
+## Cost Control
+
+Keep active versions limited. Disable or destroy old versions after rotation. Secret Manager includes a small free allowance for active versions and access operations.
+
+Reference: [Secret Manager pricing](https://cloud.google.com/secret-manager/pricing)
 
 ---
 
 ## Verification
 
-- [ ] `get_secret("litellm-api-key")` returns the correct value from Key Vault
-- [ ] `get_secret("litellm-vision-api-key")` returns the correct value
-- [ ] `get_secret("nonexistent")` returns `None` without crashing
-- [ ] LLM client initializes correctly with Key Vault secrets
-- [ ] Vision client initializes correctly with Key Vault secrets
-- [ ] Local dev works with `az login` credentials
-- [ ] No SSM/boto3 imports remain in `dependencies.py`
+- [ ] API and worker start with Secret Manager-backed environment variables.
+- [ ] Application service accounts can access only required secrets.
+- [ ] No Azure Key Vault imports remain.
+- [ ] No secret values appear in Terraform state, Git, or deployment logs.
 
 ---
 
 ## Next Phase
 
-→ [Phase 7 — Container Apps](./PHASE_7_CONTAINER_APPS.md)
+→ [Phase 7 — Cloud Run API](./PHASE_7_CLOUD_RUN_API.md)

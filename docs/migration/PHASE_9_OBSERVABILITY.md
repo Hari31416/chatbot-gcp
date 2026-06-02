@@ -1,264 +1,171 @@
-# Phase 9 — Observability Migration
+# Phase 9 — Observability, Budgets & Cost Guardrails
 
-> Replace CloudWatch Logs with Azure Monitor (Log Analytics + Application Insights).
+> Replace Azure Monitor and Application Insights with Cloud Logging, Cloud Monitoring, and billing alerts.
 
 ---
 
 ## Goal
 
-Set up centralized logging and tracing for the Container App and Azure Function using Azure Monitor. The backend already uses Python's `logging` module, so this phase is mostly configuration — no application code changes required.
+Add enough visibility for a PoC without introducing paid telemetry tooling or high-volume logs.
 
 ---
 
-## Current State (AWS)
+## Current State (Azure)
 
-### CloudWatch Logging
-
-| Component      | Log Group                                    | Retention |
-| :------------- | :------------------------------------------- | :-------- |
-| Backend Lambda | `/aws/lambda/ChatbotBackendFunction`         | 7 days    |
-| Worker Lambda  | `/aws/lambda/ChatbotIngestionWorkerFunction` | 7 days    |
-
-Logs are structured via Python's `logging` module → stdout → CloudWatch.
+| Component         | Azure Service                          |
+| :---------------- | :------------------------------------- |
+| Container logs    | Container Apps logs                    |
+| Worker logs       | Azure Functions + Application Insights |
+| Central workspace | Log Analytics                          |
+| Provisioning      | `infra/modules/monitoring.bicep`       |
 
 ---
 
-## Target State (Azure)
+## Target State (GCP)
 
-### Azure Monitor Stack
+| Component                    | GCP Service                 |
+| :--------------------------- | :-------------------------- |
+| API and worker stdout/stderr | Cloud Logging               |
+| Service metrics              | Cloud Monitoring            |
+| Error visibility             | Log-based alert policies    |
+| Spend warning                | Cloud Billing budget alerts |
 
-| Component                   | Azure Service | Purpose                                            |
-| :-------------------------- | :------------ | :------------------------------------------------- |
-| **Log Analytics Workspace** | Azure Monitor | Central log store (5 GB/month free)                |
-| **Application Insights**    | Azure Monitor | Request tracing, dependency tracking, live metrics |
-
-### Automatic Integration
-
-- **Container Apps** automatically stream stdout/stderr to Log Analytics when a workspace is linked to the Container Apps Environment.
-- **Azure Functions** automatically integrate with Application Insights when `APPLICATIONINSIGHTS_CONNECTION_STRING` is set.
+Cloud Run automatically sends container logs written to stdout and stderr to Cloud Logging.
 
 ---
 
 ## Code Changes
 
-### 9.1 Backend — No Code Changes Required
+### 9.1 Keep Structured Logging
 
-The backend already uses Python's `logging` module throughout:
+Retain `backend/app/logging_config.py`, but ensure each log event includes useful fields:
 
-- `app/logging_config.py` configures log levels
-- All services use `logger = logging.getLogger(__name__)`
-- Output goes to stdout, which Container Apps captures automatically
+```python
+logger.info(
+    "rag_ingestion_completed",
+    extra={
+        "document_id": document_id,
+        "user_id": user_id,
+        "chunks_ingested": result.chunks_ingested,
+    },
+)
+```
 
-### 9.2 Optional: Add OpenTelemetry for Rich Tracing
+Never log:
 
-For enhanced request tracing (optional, not required):
+- Firebase ID tokens
+- LiteLLM keys
+- Signed GCS URLs
+- Full prompts or extracted document content
+- Uploaded file bytes
+
+### 9.2 Add Request Correlation
+
+Propagate an inbound `X-Cloud-Trace-Context` value or create a request ID in FastAPI middleware. Include it in API and worker logs.
+
+### 9.3 Update `get-outputs.sh`
+
+Replace Azure output lookup with:
 
 ```bash
-uv add opentelemetry-instrumentation-fastapi azure-monitor-opentelemetry-exporter
-```
+#!/usr/bin/env bash
+set -euo pipefail
 
-```python
-# app/main.py (optional enhancement)
-from azure.monitor.opentelemetry.exporter import AzureMonitorTraceExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-
-# Only enable if Application Insights is configured
-app_insights_conn = os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING")
-if app_insights_conn:
-    from opentelemetry import trace
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-
-    provider = TracerProvider()
-    exporter = AzureMonitorTraceExporter(connection_string=app_insights_conn)
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-    trace.set_tracer_provider(provider)
-    FastAPIInstrumentor.instrument_app(app)
-```
-
-> [!TIP]
-> OpenTelemetry integration is optional for Phase 9. Basic stdout logging works without any code changes. Add it later for production-grade distributed tracing.
-
-### 9.3 Update `app/logging_config.py`
-
-Ensure structured JSON logging for better Azure Monitor parsing:
-
-```python
-import json
-import logging
-import os
-import sys
-
-
-class JsonFormatter(logging.Formatter):
-    """JSON log formatter for Azure Monitor ingestion."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        log_entry = {
-            "timestamp": self.formatTime(record),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-        }
-        if record.exc_info and record.exc_info[0]:
-            log_entry["exception"] = self.formatException(record.exc_info)
-        return json.dumps(log_entry)
-
-
-def configure_logging() -> None:
-    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    use_json = os.getenv("LOG_FORMAT", "text").lower() == "json"
-
-    root = logging.getLogger()
-    root.setLevel(getattr(logging, log_level, logging.INFO))
-
-    handler = logging.StreamHandler(sys.stdout)
-    if use_json:
-        handler.setFormatter(JsonFormatter())
-    else:
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        )
-
-    root.handlers.clear()
-    root.addHandler(handler)
+terraform -chdir=gcp-infra output
+gcloud run services describe chatbot-api \
+  --region "${GCP_REGION:-asia-south1}" \
+  --format='value(status.url)'
+gcloud run services describe chatbot-worker \
+  --region "${GCP_REGION:-asia-south1}" \
+  --format='value(status.url)'
 ```
 
 ---
 
-## Bicep Module: `infra/modules/monitoring.bicep`
+## Terraform
 
-```bicep
-param location string
-param environmentName string
+Create a notification channel manually or pass its ID as a variable. Add an error-rate alert:
 
-resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
-  name: 'log-chatbot-${environmentName}'
-  location: location
-  tags: { 'azd-env-name': environmentName }
-  properties: {
-    sku: { name: 'PerGB2018' }
-    retentionInDays: 30
-    features: {
-      enableLogAccessUsingOnlyResourcePermissions: true
+```hcl
+variable "notification_channel_id" {
+  type    = string
+  default = ""
+}
+
+resource "google_monitoring_alert_policy" "api_errors" {
+  display_name = "chatbot-api HTTP 5xx"
+  combiner     = "OR"
+
+  conditions {
+    display_name = "Cloud Run 5xx responses"
+    condition_threshold {
+      filter          = "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/request_count\" AND metric.labels.response_code_class=\"5xx\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "0s"
+      aggregations {
+        alignment_period   = "300s"
+        per_series_aligner = "ALIGN_SUM"
+      }
     }
   }
+
+  notification_channels = var.notification_channel_id == "" ? [] : [var.notification_channel_id]
 }
-
-resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
-  name: 'appi-chatbot-${environmentName}'
-  location: location
-  kind: 'web'
-  tags: { 'azd-env-name': environmentName }
-  properties: {
-    Application_Type: 'web'
-    WorkspaceResourceId: logAnalyticsWorkspace.id
-    IngestionMode: 'LogAnalytics'
-    RetentionInDays: 30
-  }
-}
-
-output logAnalyticsWorkspaceId string = logAnalyticsWorkspace.id
-output appInsightsConnectionString string = appInsights.properties.ConnectionString
-output appInsightsInstrumentationKey string = appInsights.properties.InstrumentationKey
 ```
 
-### Link to Container Apps Environment
-
-Update `infra/modules/container-apps.bicep`:
-
-```diff
- resource containerAppEnv 'Microsoft.App/managedEnvironments@2023-05-01' = {
-   name: 'cae-chatbot-${environmentName}'
-   location: location
-   properties: {
-+    appLogsConfiguration: {
-+      destination: 'log-analytics'
-+      logAnalyticsConfiguration: {
-+        customerId: logAnalyticsWorkspace.properties.customerId
-+        sharedKey: logAnalyticsWorkspace.listKeys().primarySharedKey
-+      }
-+    }
-   }
- }
-```
-
-### Link to Azure Function
-
-Add to Function App settings:
-
-```bicep
-{ name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsightsConnectionString }
-```
-
----
-
-## Querying Logs
-
-### Container Apps Logs (KQL)
-
-```kql
-// View recent backend logs
-ContainerAppConsoleLogs_CL
-| where ContainerAppName_s == "chatbot-backend"
-| project TimeGenerated, Log_s
-| order by TimeGenerated desc
-| take 50
-
-// Find errors
-ContainerAppConsoleLogs_CL
-| where ContainerAppName_s == "chatbot-backend"
-| where Log_s contains "ERROR"
-| project TimeGenerated, Log_s
-| order by TimeGenerated desc
-```
-
-### Application Insights (KQL)
-
-```kql
-// Request performance
-requests
-| where name contains "chat/stream"
-| summarize avg(duration), count() by bin(timestamp, 1h)
-| render timechart
-
-// Failures
-exceptions
-| order by timestamp desc
-| take 20
-```
-
----
-
-## Environment Variables
+Create the billing budget after retrieving the billing account ID:
 
 ```bash
-# Add to Container App env vars
-APPLICATIONINSIGHTS_CONNECTION_STRING=InstrumentationKey=...;IngestionEndpoint=...
-LOG_FORMAT=json     # Optional: enable JSON logging
-LOG_LEVEL=INFO      # Keep at INFO to stay within 5 GB free tier
+gcloud billing budgets create \
+  --billing-account="$GCP_BILLING_ACCOUNT_ID" \
+  --display-name="chatbot-poc-budget" \
+  --budget-amount=10USD \
+  --threshold-rule=percent=0.5 \
+  --threshold-rule=percent=0.9 \
+  --threshold-rule=percent=1.0
+```
+
+Budget alerts notify; they do not automatically stop spending.
+
+---
+
+## Operational Commands
+
+```bash
+gcloud run services logs read chatbot-api --region asia-south1 --limit 100
+gcloud run services logs read chatbot-worker --region asia-south1 --limit 100
+gcloud logging read 'resource.type="cloud_run_revision" severity>=ERROR' --limit 50
 ```
 
 ---
 
-## Cost Considerations
+## Cost Guardrails
 
-> [!WARNING]
-> **Trap #3 from the migration guide applies here.** Keep `LOG_LEVEL=INFO` (not `DEBUG`) in production. Debug logging with large JSON payloads can exceed the 5 GB/month free tier quickly.
+- Keep application log level at `INFO`; do not log request bodies.
+- Cap Cloud Run maximum instances.
+- Set GCS lifecycle rules for temporary objects.
+- Cap RAG pages and chunks before Document AI and embedding calls.
+- Keep Document AI Layout Parser opt-in.
+- Add a billing budget before load or document-ingestion testing.
+
+References:
+
+- [Cloud Logging pricing](https://cloud.google.com/stackdriver/pricing)
+- [Cloud Billing budgets](https://cloud.google.com/billing/docs/how-to/budgets)
 
 ---
 
 ## Verification
 
-- [ ] Container App logs appear in Log Analytics workspace
-- [ ] Function App logs appear in Application Insights
-- [ ] KQL queries return expected results
-- [ ] Log retention is set to 30 days
-- [ ] `LOG_LEVEL=INFO` is configured (not DEBUG)
-- [ ] Free tier ingestion (5 GB/month) is sufficient for dev usage
+- [ ] API and worker logs appear in Cloud Logging.
+- [ ] A synthetic worker failure is visible and searchable.
+- [ ] The 5xx alert policy exists.
+- [ ] A `$10` PoC budget with `50%`, `90%`, and `100%` thresholds exists.
+- [ ] Logs contain no tokens, secrets, signed URLs, prompts, or document text.
 
 ---
 
 ## Next Phase
 
-→ [Phase 10 — Cleanup & Cutover](./PHASE_10_CUTOVER.md)
+→ [Phase 10 — Cutover & Cleanup](./PHASE_10_CUTOVER.md)

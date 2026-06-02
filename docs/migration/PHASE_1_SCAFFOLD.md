@@ -1,247 +1,232 @@
-# Phase 1 — Project Scaffold & IaC Bootstrap
+# Phase 1 — Project Scaffold & Terraform Bootstrap
 
-> Replace AWS SAM `template.yaml` with Azure Bicep modules and set up the Azure Developer CLI (`azd`) project structure.
+> Add the GCP deployment scaffold while preserving the Azure Bicep deployment for rollback.
 
 ---
 
 ## Goal
 
-Set up the Azure project scaffold so that all subsequent phases have a target to deploy into. This phase creates the IaC foundation but does **not** provision any resources yet — each phase will add its own Bicep module.
+Create a Terraform project for a minimal-cost PoC in `asia-south1`. This phase enables APIs and defines shared variables but does not remove Azure infrastructure.
 
 ---
 
-## Current State (AWS)
+## Current State (Azure)
 
-| Artifact                             | Role                                                                                    |
-| :----------------------------------- | :-------------------------------------------------------------------------------------- |
-| `template.yaml` (SAM/CFN, 476 lines) | Declares all AWS resources: Lambda, API Gateway, DynamoDB, S3, Cognito, SQS, S3 Vectors |
-| `deploy-backend.sh`                  | Runs `sam build` + `sam deploy`                                                         |
-| `deploy-frontend.sh`                 | Runs `aws s3 sync` to push frontend dist                                                |
-| `.env.example`                       | 38 env vars, all AWS-flavored                                                           |
+| Artifact                | Role                                  |
+| :---------------------- | :------------------------------------ |
+| `azure.yaml`            | Azure Developer CLI project           |
+| `infra/main.bicep`      | Subscription-level Azure orchestrator |
+| `infra/modules/*.bicep` | Azure service modules                 |
+| `deploy-*.sh`           | Azure deployment scripts              |
 
 ---
 
-## Target State (Azure)
+## Target State (GCP)
 
-```
-chatbot-azure/
-├── azure.yaml                      # azd project manifest
-├── infra/
-│   ├── main.bicep                  # Orchestrator — imports all modules
-│   ├── main.parameters.json        # Environment-specific overrides
-│   ├── modules/
-│   │   ├── resource-group.bicep    # Resource group (Phase 1)
-│   │   ├── storage.bicep           # Blob Storage + Storage Queue (Phases 2 & 5)
-│   │   ├── cosmos.bicep            # Cosmos DB (Phase 3)
-│   │   ├── auth.bicep              # Entra External ID (Phase 4 — manual steps)
-│   │   ├── functions.bicep         # Azure Functions (Phase 5)
-│   │   ├── keyvault.bicep          # Key Vault (Phase 6)
-│   │   ├── container-apps.bicep    # Container Apps (Phase 7)
-│   │   ├── static-web-app.bicep    # Static Web Apps (Phase 8)
-│   │   └── monitoring.bicep        # Log Analytics + App Insights (Phase 9)
-│   └── abbreviations.json         # Azure resource naming conventions
-├── .env.azure.example              # Azure-flavored env vars
-└── template.yaml                   # KEEP — do not delete until Phase 10
+```txt
+gcp-infra/
+├── versions.tf
+├── variables.tf
+├── terraform.tfvars.example
+├── main.tf
+├── outputs.tf
+└── modules/
+    ├── storage/
+    ├── firestore/
+    ├── ingestion/
+    ├── secrets/
+    ├── cloud-run/
+    ├── hosting/
+    └── observability/
+frontend/
+├── firebase.json
+└── .firebaserc.example
 ```
 
 ---
 
 ## Tasks
 
-### 1.1 Install Azure Tooling
+### 1.1 Install Tooling
 
 ```bash
-# Azure Developer CLI
-brew install azd
+brew install --cask google-cloud-sdk
+brew install terraform
+npm install -g firebase-tools
 
-# Azure CLI (needed for auth + resource management)
-brew install azure-cli
-
-# Azure Functions Core Tools (needed for Phase 5 local dev)
-brew install azure-functions-core-tools@4
-
-# Azure Static Web Apps CLI (needed for Phase 8 local dev)
-npm install -g @azure/static-web-apps-cli
-
-# Bicep (included with Azure CLI, verify version)
-az bicep version
-az bicep upgrade
+gcloud version
+terraform version
+firebase --version
 ```
 
-### 1.2 Authenticate
+### 1.2 Authenticate and Select a Project
 
 ```bash
-az login
-azd auth login
+gcloud auth login
+gcloud auth application-default login
+gcloud projects create "$GCP_PROJECT_ID"
+gcloud config set project "$GCP_PROJECT_ID"
+firebase login
+firebase projects:addfirebase "$GCP_PROJECT_ID"
 ```
 
-### 1.3 Initialize the `azd` Project
+Billing must be enabled because Cloud Run, Eventarc, Artifact Registry, and Document AI require a billing-backed project even when PoC use remains within free quotas.
 
-Create `azure.yaml` in the project root:
+### 1.3 Enable APIs
 
-```yaml
-# azure.yaml
-name: chatbot-azure
-metadata:
-  template: chatbot-azure
-
-services:
-  backend:
-    project: ./backend
-    host: containerapp
-    language: python
-
-  worker:
-    project: ./backend
-    host: function
-    language: python
-
-  frontend:
-    project: ./frontend
-    host: staticwebapp
-    language: js
+```bash
+gcloud services enable \
+  artifactregistry.googleapis.com \
+  cloudbuild.googleapis.com \
+  documentai.googleapis.com \
+  eventarc.googleapis.com \
+  firestore.googleapis.com \
+  iam.googleapis.com \
+  iamcredentials.googleapis.com \
+  logging.googleapis.com \
+  monitoring.googleapis.com \
+  pubsub.googleapis.com \
+  run.googleapis.com \
+  secretmanager.googleapis.com \
+  storage.googleapis.com
 ```
 
-### 1.4 Create the Bicep Orchestrator
+### 1.4 Create Terraform Bootstrap Files
 
-Create `infra/main.bicep`:
+Create `gcp-infra/versions.tf`:
 
-```bicep
-targetScope = 'subscription'
+```hcl
+terraform {
+  required_version = ">= 1.7.0"
 
-@description('Environment name (dev, staging, prod)')
-param environmentName string
-
-@description('Primary Azure region for all resources')
-param location string
-
-@description('Unique resource token for naming')
-var resourceToken = toLower(uniqueString(subscription().id, environmentName, location))
-
-// ──────────────────────────────────────────────
-// Resource Group
-// ──────────────────────────────────────────────
-resource rg 'Microsoft.Resources/resourceGroups@2021-04-01' = {
-  name: 'rg-chatbot-${environmentName}'
-  location: location
-  tags: {
-    'azd-env-name': environmentName
-    project: 'chatbot-azure'
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 6.0"
+    }
   }
 }
 
-// Module imports will be added by subsequent phases:
-// Phase 2: module storage   './modules/storage.bicep'
-// Phase 3: module cosmos    './modules/cosmos.bicep'
-// Phase 5: (queue added to storage.bicep — no separate module)
-// Phase 5: module functions './modules/functions.bicep'
-// Phase 6: module keyvault  './modules/keyvault.bicep'
-// Phase 7: module aca       './modules/container-apps.bicep'
-// Phase 8: module swa       './modules/static-web-app.bicep'
-// Phase 9: module monitor   './modules/monitoring.bicep'
-```
-
-Create `infra/main.parameters.json`:
-
-```json
-{
-  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
-  "contentVersion": "1.0.0.0",
-  "parameters": {
-    "environmentName": { "value": "${AZURE_ENV_NAME}" },
-    "location": { "value": "${AZURE_LOCATION}" }
-  }
+provider "google" {
+  project = var.project_id
+  region  = var.region
 }
 ```
 
-### 1.5 Create Azure Environment Variables Template
+Create `gcp-infra/variables.tf`:
 
-Create `.env.azure.example`:
+```hcl
+variable "project_id" { type = string }
+variable "region" {
+  type    = string
+  default = "asia-south1"
+}
+variable "environment" {
+  type    = string
+  default = "dev"
+}
+variable "firebase_web_app_id" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+```
+
+Create `gcp-infra/main.tf`:
+
+```hcl
+locals {
+  name_prefix = "chatbot-${var.environment}"
+}
+
+resource "google_project_service" "required" {
+  for_each = toset([
+    "artifactregistry.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "documentai.googleapis.com",
+    "eventarc.googleapis.com",
+    "firestore.googleapis.com",
+    "iamcredentials.googleapis.com",
+    "pubsub.googleapis.com",
+    "run.googleapis.com",
+    "secretmanager.googleapis.com",
+    "storage.googleapis.com",
+  ])
+  project            = var.project_id
+  service            = each.value
+  disable_on_destroy = false
+}
+
+resource "google_artifact_registry_repository" "containers" {
+  location      = var.region
+  repository_id = "chatbot"
+  format        = "DOCKER"
+
+  depends_on = [google_project_service.required]
+}
+```
+
+Create `gcp-infra/terraform.tfvars.example`:
+
+```hcl
+project_id  = "replace-with-project-id"
+region      = "asia-south1"
+environment = "dev"
+```
+
+### 1.5 Create a GCP Environment Template
+
+Create `.env.gcp.example`:
 
 ```bash
-# ──────────────────────────────────────────────
-# Azure Environment Configuration
-# ──────────────────────────────────────────────
-
-# Azure region (e.g. centralindia, eastus, westeurope)
-AZURE_LOCATION=centralindia
-AZURE_ENV_NAME=dev
-
-# ── Blob Storage (Phase 2) ──
-AZURE_STORAGE_ACCOUNT_NAME=
-AZURE_STORAGE_CONTAINER_NAME=uploads
-AZURE_STORAGE_CONNECTION_STRING=
-
-# ── Cosmos DB (Phase 3) ──
-COSMOS_ENDPOINT=
-COSMOS_DATABASE_NAME=chatbot
-COSMOS_CONTAINER_NAME=conversations
-COSMOS_KEY=
-
-# ── Entra Auth (Phase 4) ──
-AZURE_TENANT_ID=
-AZURE_CLIENT_ID=
-ENTRA_AUTHORITY=
-
-# ── Storage Queue (Phase 5 — uses same Storage Account) ──
-AZURE_INGESTION_QUEUE_NAME=ingestion-queue
-
-# ── Document Intelligence (Phase 5) ──
-AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT=
-AZURE_DOCUMENT_INTELLIGENCE_KEY=
-
-# ── Key Vault (Phase 6) ──
-AZURE_KEYVAULT_NAME=
-
-# ── Container Apps (Phase 7) ──
-AZURE_CONTAINER_REGISTRY=
-AZURE_CONTAINER_APP_NAME=chatbot-backend
-
-# ── LLM (unchanged — cloud-agnostic via LiteLLM) ──
+GCP_PROJECT_ID=
+GCP_REGION=asia-south1
+GCS_BUCKET_NAME=
+FIRESTORE_DATABASE=(default)
+FIREBASE_PROJECT_ID=
+FIREBASE_WEB_API_KEY=
+FIREBASE_AUTH_EMULATOR_HOST=
+DOCUMENT_AI_LOCATION=us
+DOCUMENT_AI_PROCESSOR_ID=
+DOCUMENT_AI_USE_LAYOUT_PARSER=false
+PUBSUB_INGESTION_TOPIC=chatbot-ingestion
+WORKER_BASE_URL=
 LITELLM_MODEL=gpt-4o-mini
 LITELLM_API_KEY=
-LITELLM_BASE_URL=
 LITELLM_VISION_MODEL=gemini/gemini-3.1-flash-lite
 LITELLM_VISION_API_KEY=
 LITELLM_EMBEDDING_MODEL=gemini/gemini-embedding-2
 LITELLM_EMBEDDING_API_KEY=
-
-# ── RAG Config (unchanged) ──
 EMBEDDING_DIMENSION=768
 RAG_TOP_K=3
 RAG_CHUNK_SIZE=800
 RAG_CHUNK_OVERLAP=80
-
-# ── App Config (unchanged) ──
-CONTEXT_TTL_SECONDS=3600
-MAX_IMAGE_BYTES=5242880
-ALLOWED_IMAGE_MIME_TYPES=image/png,image/jpeg,image/webp
-MAX_HISTORY_MESSAGES=10
-LOG_LEVEL=INFO
 ```
 
 ---
 
 ## Verification
 
-- [ ] `azd version` outputs ≥ 1.x
-- [ ] `az bicep version` outputs ≥ 0.25.x
-- [ ] `azure.yaml` is valid: `azd config list` runs without error
-- [ ] `infra/main.bicep` compiles: `az bicep build --file infra/main.bicep`
-- [ ] No existing code is modified — this phase is purely additive
+- [ ] `gcloud config get-value project` prints the intended project ID.
+- [ ] `gcloud services list --enabled` includes the required APIs.
+- [ ] `terraform -chdir=gcp-infra fmt -check`
+- [ ] `terraform -chdir=gcp-infra init`
+- [ ] `terraform -chdir=gcp-infra validate`
+- [ ] `terraform -chdir=gcp-infra apply` creates the `chatbot` Artifact Registry repository before Phase 5 container builds.
+- [ ] Existing Azure files remain unchanged.
 
 ---
 
 ## Decisions & Notes
 
-> [!NOTE]
-> The original `template.yaml` will be **preserved** throughout the entire migration and only archived in Phase 10. This allows rollback to AWS at any point.
-
 > [!IMPORTANT]
-> Bicep modules are **not provisioned** in this phase. Each subsequent phase will add its module and provision incrementally using `azd provision`.
+> Commit `terraform.tfvars.example`, never a real `terraform.tfvars`. Keep Terraform state out of Git.
+
+> [!NOTE]
+> `asia-south1` is the default application region. Document AI processor availability must be checked when the processor is created; its processor location can differ from the application region.
 
 ---
 
 ## Next Phase
 
-→ [Phase 2 — Blob Storage](./PHASE_2_BLOB_STORAGE.md)
+→ [Phase 2 — Cloud Storage](./PHASE_2_CLOUD_STORAGE.md)
