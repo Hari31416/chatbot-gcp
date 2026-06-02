@@ -7,7 +7,7 @@ import sys
 
 
 class JsonFormatter(logging.Formatter):
-    """JSON log formatter for Azure Monitor ingestion."""
+    """JSON log formatter for Cloud Logging ingestion."""
 
     def format(self, record: logging.LogRecord) -> str:
         log_entry = {
@@ -43,8 +43,6 @@ def configure_logging() -> None:
     if log_level != "DEBUG":
         logging.getLogger("urllib3").setLevel(logging.WARNING)
         logging.getLogger("LiteLLM").setLevel(logging.WARNING)
-        logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
-        logging.getLogger("azure.identity").setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:

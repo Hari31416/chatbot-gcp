@@ -272,6 +272,7 @@ def test_client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
 
     monkeypatch.delenv("CLERK_ISSUER", raising=False)
     monkeypatch.delenv("CLERK_AUTHORIZED_PARTIES", raising=False)
+    monkeypatch.setenv("RAG_TOP_K", "3")
     get_settings.cache_clear()
 
     repo = InMemoryConversationRepository()
@@ -280,9 +281,7 @@ def test_client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     vector_store = FakeVectorStore()
     rag_service = FakeRagService()
     settings = Settings(
-        cosmos_endpoint="https://localhost:8081",
-        clerk_issuer=None,
-        clerk_authorized_parties=[],
+        rag_top_k=3,
         max_image_bytes=5 * 1024 * 1024,
         allowed_image_mime_types=["image/png", "image/jpeg", "image/webp"],
     )

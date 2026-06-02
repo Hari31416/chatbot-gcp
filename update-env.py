@@ -4,20 +4,14 @@ import os
 
 
 def main():
-    print("🚀 Fetching deployment outputs from Azure...")
+    print("🚀 Fetching deployment outputs from GCP (Terraform)...")
     try:
         result = subprocess.run(
             [
-                "az",
-                "deployment",
-                "sub",
-                "show",
-                "--name",
-                "main",
-                "--query",
-                "properties.outputs",
-                "--output",
-                "json",
+                "terraform",
+                "-chdir=gcp-infra",
+                "output",
+                "-json",
             ],
             capture_output=True,
             text=True,
@@ -36,12 +30,8 @@ def main():
         return None
 
     env_updates = {
-        "AZURE_STORAGE_ACCOUNT_NAME": get_output_val("AZURE_STORAGE_ACCOUNT_NAME"),
-        "COSMOS_ENDPOINT": get_output_val("COSMOS_ENDPOINT"),
-        "AZURE_KEYVAULT_NAME": get_output_val("AZURE_KEYVAULT_NAME"),
-        "AZURE_CONTAINER_REGISTRY": get_output_val("AZURE_CONTAINER_REGISTRY"),
-        "AZURE_SWA_DEPLOYMENT_TOKEN": get_output_val("AZURE_SWA_DEPLOYMENT_TOKEN"),
-        "AZURE_FUNCTION_APP_NAME": get_output_val("AZURE_FUNCTION_APP_NAME"),
+        "GCS_BUCKET_NAME": get_output_val("bucket_name"),
+        "WORKER_BASE_URL": get_output_val("worker_url"),
     }
 
     env_vars = {}
@@ -64,7 +54,7 @@ def main():
                     k, v = line.split("=", 1)
                     env_vars[k.strip()] = v.strip()
 
-    # Update with new Bicep outputs
+    # Update with new Terraform outputs
     for k, v in env_updates.items():
         if v:
             env_vars[k] = v
@@ -72,12 +62,12 @@ def main():
     # Write back to .env
     with open(".env", "w") as f:
         f.write("# ──────────────────────────────────────────────\n")
-        f.write("# Azure Environment Configuration (Auto-Generated)\n")
+        f.write("# GCP Environment Configuration (Auto-Generated)\n")
         f.write("# ──────────────────────────────────────────────\n")
         for k, v in sorted(env_vars.items()):
             f.write(f"{k}={v}\n")
 
-    print("✅ Successfully updated .env with Azure deployment outputs!")
+    print("✅ Successfully updated .env with GCP deployment outputs!")
 
 
 if __name__ == "__main__":

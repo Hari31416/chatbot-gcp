@@ -25,6 +25,9 @@ class RagService:
         chunk_overlap: int = 80,
         storage: Any = None,
         doc_intelligence_client: Any = None,
+        processor_name: str | None = None,
+        max_pages: int = 25,
+        max_chunks: int = 200,
     ) -> None:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
@@ -35,6 +38,9 @@ class RagService:
         self.chunk_overlap = chunk_overlap
         self.storage = storage
         self.doc_intelligence_client = doc_intelligence_client
+        self.processor_name = processor_name
+        self.max_pages = max_pages
+        self.max_chunks = max_chunks
 
     async def ingest_document(
         self, filename: str, content: str, user_id: str, document_id: str | None = None
@@ -63,66 +69,75 @@ class RagService:
     async def ingest_binary_document(
         self, filename: str, data: bytes, mime_type: str, user_id: str, document_id: str | None = None
     ) -> RagIngestResult:
-        import os
         from anyio import to_thread
         from uuid import uuid4
+        from google.cloud import documentai
 
         if not self.storage:
             raise ValueError("Storage client must be configured to process binary documents")
-        if not self.doc_intelligence_client:
-            raise ValueError("Document Intelligence client must be configured to process binary documents")
 
         if not document_id:
             document_id = str(uuid4())
 
-        # 1. Upload raw binary to temporary staging container
-        temp_key = f"rag-temp/{user_id}/{document_id}/{filename}"
-        logger.info("Uploading raw binary document filename=%s user_id=%s temp_key=%s", filename, user_id, temp_key)
-        await to_thread.run_sync(
-            lambda: self.storage.upload_bytes(
-                key=temp_key,
-                data=data,
-                mime_type=mime_type,
-            )
-        )
+        # 1. Check local text file parsing
+        if mime_type in ("text/plain", "text/markdown") or filename.lower().endswith((".txt", ".md")):
+            logger.info("Processing plain text document locally: %s", filename)
+            extracted_text = data.decode("utf-8", errors="ignore")
+        else:
+            if not self.doc_intelligence_client or not self.processor_name:
+                raise ValueError("Document AI client and processor_name must be configured to process binary documents")
 
-        try:
-            # 2. Analyze with Document Intelligence (prebuilt-layout model)
-            logger.info("Analyzing document with Azure AI Document Intelligence for temp_key=%s", temp_key)
-            
-            poller = await to_thread.run_sync(
-                lambda: self.doc_intelligence_client.begin_analyze_document(
-                    "prebuilt-layout",
-                    data,
-                    content_type=mime_type,
-                    output_content_format="markdown",
+            # Upload raw binary to temporary staging container
+            temp_key = f"rag-temp/{user_id}/{document_id}/{filename}"
+            logger.info("Uploading raw binary document filename=%s user_id=%s temp_key=%s", filename, user_id, temp_key)
+            await to_thread.run_sync(
+                lambda: self.storage.upload_bytes(
+                    key=temp_key,
+                    data=data,
+                    mime_type=mime_type,
                 )
             )
-            result = await to_thread.run_sync(poller.result)
 
-            # 3. Extract markdown content
-            extracted_text = result.content or ""
-            logger.info(
-                "Extracted %d chars from document=%s using Document Intelligence",
-                len(extracted_text), filename,
-            )
-
-            # 4. Check page limit
-            if result.pages and len(result.pages) > 100:
-                raise ValueError(f"Document exceeds 100 page limit (got {len(result.pages)} pages)")
-
-        finally:
-            # 5. Clean up temporary staging blob
             try:
-                logger.info("Cleaning up staging blob: %s", temp_key)
-                await to_thread.run_sync(lambda: self.storage.delete_blob(temp_key))
-            except Exception as e:
-                logger.warning("Failed to clean up staging blob %s: %s", temp_key, e)
+                # 2. Analyze with GCP Document AI
+                logger.info("Analyzing document with GCP Document AI for temp_key=%s", temp_key)
+                
+                def _call_doc_ai():
+                    request = documentai.ProcessRequest(
+                        name=self.processor_name,
+                        raw_document=documentai.RawDocument(content=data, mime_type=mime_type)
+                    )
+                    return self.doc_intelligence_client.process_document(request=request)
 
-        # 6. Split text and upsert to vector store
+                result = await to_thread.run_sync(_call_doc_ai)
+                document = result.document
+
+                # 3. Check page limit
+                if document.pages and len(document.pages) > self.max_pages:
+                    raise ValueError(f"Document exceeds {self.max_pages} page limit (got {len(document.pages)} pages)")
+
+                # 4. Extract markdown content
+                extracted_text = document.text or ""
+                logger.info(
+                    "Extracted %d chars from document=%s using Document AI",
+                    len(extracted_text), filename,
+                )
+
+            finally:
+                # 5. Clean up temporary staging blob
+                try:
+                    logger.info("Cleaning up staging blob: %s", temp_key)
+                    await to_thread.run_sync(lambda: self.storage.delete_blob(temp_key))
+                except Exception as e:
+                    logger.warning("Failed to clean up staging blob %s: %s", temp_key, e)
+
+        # 6. Split text and check chunk limits
         chunks = self.split_text(extracted_text)
         if not chunks:
             return RagIngestResult(document_id=document_id, chunks_ingested=0)
+
+        if len(chunks) > self.max_chunks:
+            raise ValueError(f"Document chunk count {len(chunks)} exceeds maximum limit of {self.max_chunks}")
 
         embeddings = await self.vector_store.get_embeddings(chunks)
         keys = [f"{document_id}-chunk-{idx}" for idx in range(len(chunks))]

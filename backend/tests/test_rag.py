@@ -1,3 +1,4 @@
+from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
@@ -155,54 +156,45 @@ class MockStorage:
         self.deleted.append(key)
 
 
-class MockDocumentPage:
-    pass
+class MockDocument:
+    def __init__(self, text: str, pages_count: int):
+        self.text = text
+        self.pages = [object() for _ in range(pages_count)]
 
 
-class MockDocumentResult:
-    def __init__(self, pages=5):
-        self.content = "Markdown text content from Document Intelligence"
-        self.pages = [MockDocumentPage() for _ in range(pages)]
+class MockProcessResponse:
+    def __init__(self, text: str, pages_count: int):
+        self.document = MockDocument(text, pages_count)
 
 
-class MockPoller:
-    def __init__(self, result):
-        self._result = result
-
-    def result(self):
-        return self._result
-
-
-class MockDocumentIntelligenceClient:
-    def __init__(self, pages=5, fail=False):
+class MockDocumentAiClient:
+    def __init__(self, pages: int = 5, fail: bool = False):
         self.pages = pages
         self.fail = fail
-        self.analyze_calls = []
+        self.process_calls: list[Any] = []
 
-    def begin_analyze_document(self, model_id, body, content_type, output_content_format):
-        self.analyze_calls.append({
-            "model_id": model_id,
-            "data": body,
-            "content_type": content_type,
-            "output_content_format": output_content_format
-        })
+    def process_document(self, request: Any) -> MockProcessResponse:
+        self.process_calls.append(request)
         if self.fail:
-            raise ValueError("Document Intelligence error test")
-        return MockPoller(MockDocumentResult(pages=self.pages))
+            raise ValueError("Document AI error test")
+        return MockProcessResponse("Markdown text content from Document Intelligence", self.pages)
 
 
 @pytest.mark.asyncio
 async def test_rag_service_ingest_binary_document_logic() -> None:
     vector_store = MockVectorStore()
     storage = MockStorage()
-    doc_client = MockDocumentIntelligenceClient(pages=5)
+    doc_client = MockDocumentAiClient(pages=5)
     
     service = RagService(
         vector_store=vector_store,  # type: ignore[arg-type]
         chunk_size=100,
         chunk_overlap=10,
         storage=storage,
-        doc_intelligence_client=doc_client
+        doc_intelligence_client=doc_client,
+        processor_name="projects/test-proj/locations/us/processors/test-proc",
+        max_pages=25,
+        max_chunks=200,
     )
     
     result = await service.ingest_binary_document(
@@ -221,9 +213,11 @@ async def test_rag_service_ingest_binary_document_logic() -> None:
     assert len(storage.deleted) == 1
     assert storage.deleted[0] == storage.uploaded[0]["key"]
     
-    # Assert Document Intelligence was triggered
-    assert len(doc_client.analyze_calls) == 1
-    assert doc_client.analyze_calls[0]["model_id"] == "prebuilt-layout"
+    # Assert Document AI was triggered
+    assert len(doc_client.process_calls) == 1
+    assert doc_client.process_calls[0].name == "projects/test-proj/locations/us/processors/test-proc"
+    assert doc_client.process_calls[0].raw_document.content == b"pdf binary data"
+    assert doc_client.process_calls[0].raw_document.mime_type == "application/pdf"
     
     # Assert upsert calls
     assert len(vector_store.upserts) == 1
@@ -234,14 +228,17 @@ async def test_rag_service_ingest_binary_document_logic() -> None:
 async def test_rag_service_ingest_binary_document_limit_exceeded() -> None:
     vector_store = MockVectorStore()
     storage = MockStorage()
-    doc_client = MockDocumentIntelligenceClient(pages=105)
+    doc_client = MockDocumentAiClient(pages=30)
     
     service = RagService(
         vector_store=vector_store,  # type: ignore[arg-type]
         chunk_size=100,
         chunk_overlap=10,
         storage=storage,
-        doc_intelligence_client=doc_client
+        doc_intelligence_client=doc_client,
+        processor_name="projects/test-proj/locations/us/processors/test-proc",
+        max_pages=25,
+        max_chunks=200,
     )
     
     with pytest.raises(ValueError) as excinfo:
@@ -252,9 +249,39 @@ async def test_rag_service_ingest_binary_document_limit_exceeded() -> None:
             user_id="user-123"
         )
         
-    assert "Document exceeds 100 page limit" in str(excinfo.value)
+    assert "Document exceeds 25 page limit" in str(excinfo.value)
     # Cleanup should still have run even on failure
     assert len(storage.deleted) == 1
+
+
+@pytest.mark.asyncio
+async def test_rag_service_ingest_text_document_locally() -> None:
+    vector_store = MockVectorStore()
+    storage = MockStorage()
+    doc_client = MockDocumentAiClient()
+    
+    service = RagService(
+        vector_store=vector_store,  # type: ignore[arg-type]
+        chunk_size=100,
+        chunk_overlap=10,
+        storage=storage,
+        doc_intelligence_client=doc_client,
+        processor_name=None,
+    )
+    
+    result = await service.ingest_binary_document(
+        filename="notes.txt",
+        data=b"This is plain text document parsing locally.",
+        mime_type="text/plain",
+        user_id="user-123"
+    )
+    
+    assert result.chunks_ingested == 1
+    assert len(doc_client.process_calls) == 0
+    assert len(storage.uploaded) == 0
+    assert len(vector_store.upserts) == 1
+    assert "This is plain text document parsing locally." in vector_store.upserts[0]["texts"][0]
+
 
 
 # Function app tests removed as Azure Functions are replaced by GCP Cloud Run workers in the target architecture.

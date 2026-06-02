@@ -6,9 +6,7 @@ cd frontend
 pnpm install --frozen-lockfile
 pnpm build
 
-echo "Deploying to Azure Static Web Apps..."
-npx @azure/static-web-apps-cli deploy ./dist \
-  --deployment-token "${AZURE_SWA_DEPLOYMENT_TOKEN}" \
-  --env production
+echo "Deploying to Firebase Hosting..."
+firebase deploy --only hosting --project "${GCP_PROJECT_ID:?GCP_PROJECT_ID is required}"
 
 echo "Frontend deployment complete!"

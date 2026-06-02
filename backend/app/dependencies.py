@@ -9,7 +9,7 @@ from typing import Any, cast
 import firebase_admin
 from firebase_admin import auth as firebase_auth
 from fastapi import Depends, HTTPException, Request, status
-from google.cloud import storage, firestore
+from google.cloud import storage, firestore, documentai
 
 from .repositories.conversation_repository import ConversationRepository
 from .services.llm import LlmClient
@@ -111,21 +111,39 @@ def get_vision_llm_client() -> LlmClient:
     )
 
 
+@lru_cache
+def get_document_ai_client() -> documentai.DocumentProcessorServiceClient | None:
+    settings = get_settings()
+    if not settings.document_ai_processor_id:
+        return None
+    opts = {"api_endpoint": f"{settings.document_ai_location}-documentai.googleapis.com"}
+    return documentai.DocumentProcessorServiceClient(client_options=opts)
+
+
 def get_rag_service(
     vector_store: VectorStoreClient = Depends(get_vector_store),
+    doc_ai_client: documentai.DocumentProcessorServiceClient | None = Depends(get_document_ai_client),
 ) -> RagService:
     if hasattr(vector_store, "dependency") or type(vector_store).__name__ == "Depends":
         vector_store = get_vector_store()
+    if hasattr(doc_ai_client, "dependency") or type(doc_ai_client).__name__ == "Depends":
+        doc_ai_client = get_document_ai_client()
     settings = get_settings()
     storage_svc = get_storage()
     
-    # Placeholder for GCP Document AI client in Phase 5
+    processor_name = None
+    if settings.gcp_project_id and settings.document_ai_location and settings.document_ai_processor_id:
+        processor_name = f"projects/{settings.gcp_project_id}/locations/{settings.document_ai_location}/processors/{settings.document_ai_processor_id}"
+
     return RagService(
         vector_store=vector_store,
         chunk_size=settings.rag_chunk_size,
         chunk_overlap=settings.rag_chunk_overlap,
         storage=storage_svc,
-        doc_intelligence_client=None,
+        doc_intelligence_client=doc_ai_client,
+        processor_name=processor_name,
+        max_pages=settings.max_rag_pages,
+        max_chunks=settings.max_rag_chunks,
     )
 
 

@@ -40,3 +40,55 @@ module "firestore" {
   project_id = var.project_id
   region     = var.region
 }
+
+module "secrets" {
+  source     = "./modules/secrets"
+  project_id = var.project_id
+  secret_ids = ["litellm-api-key", "litellm-vision-api-key", "litellm-embedding-api-key"]
+  
+  depends_on = [google_project_service.required]
+}
+
+module "cloud_run" {
+  source      = "./modules/cloud-run"
+  project_id  = var.project_id
+  region      = var.region
+  api_image   = var.api_image
+  bucket_name = module.storage.bucket_name
+  secret_ids  = module.secrets.secret_ids
+
+  depends_on = [google_project_service.required]
+}
+
+module "ingestion" {
+  source       = "./modules/ingestion"
+  project_id   = var.project_id
+  region       = var.region
+  bucket_name  = module.storage.bucket_name
+  worker_image = var.worker_image
+  secret_ids   = module.secrets.secret_ids
+
+  depends_on = [google_project_service.required]
+}
+
+module "observability" {
+  source                  = "./modules/observability"
+  project_id              = var.project_id
+  notification_channel_id = var.notification_channel_id
+}
+
+output "api_url" {
+  value       = module.cloud_run.api_url
+  description = "The URL of the deployed FastAPI API"
+}
+
+output "worker_url" {
+  value       = module.ingestion.worker_url
+  description = "The URL of the deployed ingestion worker"
+}
+
+output "bucket_name" {
+  value       = module.storage.bucket_name
+  description = "The name of the GCS bucket"
+}
+

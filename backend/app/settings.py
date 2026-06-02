@@ -33,6 +33,13 @@ class Settings(BaseSettings):
         default=None, validation_alias="FIREBASE_AUTH_EMULATOR_HOST"
     )
 
+    # ── Document AI Settings ──
+    document_ai_location: str = Field(default="us", validation_alias="DOCUMENT_AI_LOCATION")
+    document_ai_processor_id: str | None = Field(default=None, validation_alias="DOCUMENT_AI_PROCESSOR_ID")
+    document_ai_use_layout_parser: bool = Field(default=False, validation_alias="DOCUMENT_AI_USE_LAYOUT_PARSER")
+    max_rag_pages: int = Field(default=25, validation_alias="MAX_RAG_PAGES")
+    max_rag_chunks: int = Field(default=200, validation_alias="MAX_RAG_CHUNKS")
+
     # ── General Settings ──
     context_ttl_seconds: int = Field(
         default=3600, validation_alias="CONTEXT_TTL_SECONDS"
