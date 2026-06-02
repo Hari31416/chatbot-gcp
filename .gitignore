@@ -67,3 +67,5 @@ terraformrc
 # Ignore terraform.tfvars as it contains secrets
 *.tfvars
 *.tfvars.json
+
+.firebase/
