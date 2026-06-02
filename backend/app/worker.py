@@ -6,7 +6,7 @@ import logging
 from typing import Any
 
 from anyio import to_thread
-from cloudevents.http import from_http
+from cloudevents.v1.http import from_http
 from fastapi import FastAPI, HTTPException, Request, status
 
 from .dependencies import (

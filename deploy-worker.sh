@@ -8,6 +8,9 @@ fi
 
 export GCP_REGION="${GCP_REGION:-asia-south1}"
 export IMAGE_TAG="$(git rev-parse --short HEAD 2>/dev/null || echo latest)"
+if ! git diff --quiet HEAD 2>/dev/null; then
+  export IMAGE_TAG="${IMAGE_TAG}-dirty-$(date +%s)"
+fi
 export WORKER_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID:?GCP_PROJECT_ID is required}/chatbot/worker:${IMAGE_TAG}"
 
 echo "🐳 Building ingestion worker container image via Cloud Build..."
