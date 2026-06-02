@@ -32,6 +32,11 @@ resource "google_firestore_index" "rag_chunks_vector" {
   collection = "rag_chunks"
 
   fields {
+    field_path = "__name__"
+    order      = "ASCENDING"
+  }
+
+  fields {
     field_path = "embedding"
     vector_config {
       dimension = 768

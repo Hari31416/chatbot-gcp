@@ -321,45 +321,80 @@ To lock the application aesthetic to light mode by default, the UI must prevent 
 
 ---
 
-## 11. Firestore Native Vector Search Index
+## 11. Firestore Native Vector Search Index Schema Alignment
 
 ### The Issue
-RAG document ingestion produces text embeddings that are stored inside the `rag_chunks` subcollection. During ingestion/document searches, Firestore Native requires a flat vector index on the `embedding` field to index and query vector spaces. Without it, transactions fail with a `400 Missing vector index` error.
+RAG document ingestion produces text embeddings stored inside the `rag_chunks` subcollection. Firestore Native requires a vector index on the `embedding` field to run vector similarity searches. However, Firestore vector indexes implicitly include the document identifier `__name__` (order ASCENDING). Our original Terraform definition only declared the `embedding` field, causing Terraform to continually detect state drift and plan to replace (destroy-and-recreate) the index on every deploy. Due to Firestore deleting indexes asynchronously, the subsequent recreate failed with a `409 Conflict: index already exists` error.
 
 ### Implemented Solution
-* **CLI index provisioning:** Triggered immediate asynchronous index creation on Google Cloud:
-  ```bash
-  gcloud firestore indexes composite create \
-    --project=rag-chatbot-hari31416 \
-    --collection-group=rag_chunks \
-    --query-scope=COLLECTION \
-    --field-config=vector-config='{"dimension":"768","flat": "{}"}',field-path=embedding
-  ```
-* **IaC Declarative setup:** Configured the index inside the Firestore Terraform module [gcp-infra/modules/firestore/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/firestore/main.tf) to make it highly reproducible:
-  ```hcl
-  resource "google_firestore_index" "rag_chunks_vector" {
-    project    = var.project_id
-    database   = google_firestore_database.default.name
-    collection = "rag_chunks"
+We updated [gcp-infra/modules/firestore/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/firestore/main.tf) to include the implicit `__name__` field, aligning the IaC configuration perfectly with Firestore's internal schema structure:
+```hcl
+resource "google_firestore_index" "rag_chunks_vector" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "rag_chunks"
 
-    fields {
-      field_path = "embedding"
-      vector_config {
-        dimension = 768
-        flat {}
-      }
+  fields {
+    field_path = "__name__"
+    order      = "ASCENDING"
+  }
+
+  fields {
+    field_path = "embedding"
+    vector_config {
+      dimension = 768
+      flat {}
     }
   }
-  ```
+}
+```
 
 ---
 
-## 12. Verification and Next Steps
+## 13. Document AI Ingestion Variable Masking Fix
 
-1. To apply all fixes (CORS, Light mode lock, Vector index declarative configs, and dynamic preservation), run the deployments:
+### The Issue
+When trying to upload PDF files, the worker returned a `ValueError` indicating that the Document AI client and `processor_name` were not configured:
+```text
+ValueError: Document AI client and processor_name must be configured to process binary documents
+```
+Even though the deploy scripts parse and forward `.env` configurations (e.g. `DOCUMENT_AI_PROCESSOR_ID`), the Terraform config for the `chatbot-worker` service statically declared duplicate variables inside the container block (with empty default values, e.g. `value = ""`). Under GCP Cloud Run, duplicate environment variables evaluate such that the first static empty variable block takes precedence, masking the custom value supplied in your `.env`.
+
+### Implemented Solution
+We modified [gcp-infra/modules/ingestion/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/ingestion/main.tf) to completely remove the hardcoded static `env` overrides for Document AI and RAG settings. The worker now dynamically and cleanly inherits these values from `additional_env_vars` populated from your `.env` file at deploy-time.
+
+---
+
+## 14. Ingestion Worker Document AI API IAM Access Permission
+
+### The Error
+```text
+google.api_core.exceptions.PermissionDenied: 403 Permission 'documentai.processors.processOnline' denied on resource '//documentai.googleapis.com/projects/rag-chatbot-hari31416/locations/us/processors/2c1d6847070277d5' (or it may not exist). [reason: "IAM_PERMISSION_DENIED"]
+```
+
+### Root Cause
+While the Document AI API is enabled in the project, the custom service account assigned to the background worker (`chatbot-worker@rag-chatbot-hari31416.iam.gserviceaccount.com`) lacked the explicit Identity and Access Management (IAM) role required to execute synchronous document parsing requests.
+
+### Implemented Solution
+We declared a new IAM member resource inside the ingestion module in [gcp-infra/modules/ingestion/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/ingestion/main.tf) to grant the worker the standard Document AI API User role:
+```hcl
+# Grant Worker access to Document AI API
+resource "google_project_iam_member" "worker_documentai" {
+  project = var.project_id
+  role    = "roles/documentai.apiUser"
+  member  = "serviceAccount:${google_service_account.worker.email}"
+}
+```
+We also added `google_project_iam_member.worker_documentai` to the `google_cloud_run_v2_service.worker` `depends_on` constraints, guaranteeing that the IAM permission is fully provisioned on GCP before the worker container service revision is created.
+
+---
+
+## 15. Verification and Next Steps
+
+1. Execute the deployment script for the worker to apply these changes (IAM permissions, index schema alignment, and worker environment settings):
    ```bash
-   make deploy-backend
-   make deploy-worker
-   make deploy-frontend
+   ./deploy-worker.sh
    ```
-2. Verify that the build succeeds without timing out, the RAG chunks ingest cleanly once the GCP vector index is `READY`, and the chat stream interface functions smoothly!
+2. Verify that:
+   * The Firestore vector index is created cleanly with 0 errors.
+   * Uploading a PDF document parses successfully without `500` errors, chunks the text, and stores the resulting text/embeddings inside Firestore Native!

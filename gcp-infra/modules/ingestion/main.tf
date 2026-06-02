@@ -58,6 +58,13 @@ resource "google_project_iam_member" "worker_secrets" {
   member  = "serviceAccount:${google_service_account.worker.email}"
 }
 
+# Grant Worker access to Document AI API
+resource "google_project_iam_member" "worker_documentai" {
+  project = var.project_id
+  role    = "roles/documentai.apiUser"
+  member  = "serviceAccount:${google_service_account.worker.email}"
+}
+
 resource "google_service_account" "eventarc_invoker" {
   account_id   = "chatbot-eventarc-invoker"
   display_name = "Eventarc Cloud Run invoker"
@@ -81,6 +88,7 @@ resource "google_cloud_run_v2_service" "worker" {
     google_project_iam_member.worker_firestore,
     google_storage_bucket_iam_member.worker_storage,
     google_project_iam_member.worker_secrets,
+    google_project_iam_member.worker_documentai,
   ]
 
   template {
@@ -110,27 +118,6 @@ resource "google_cloud_run_v2_service" "worker" {
         value = "(default)"
       }
 
-      # Ingestion settings
-      env {
-        name  = "DOCUMENT_AI_LOCATION"
-        value = "us"
-      }
-      env {
-        name  = "DOCUMENT_AI_PROCESSOR_ID"
-        value = ""
-      }
-      env {
-        name  = "DOCUMENT_AI_USE_LAYOUT_PARSER"
-        value = "false"
-      }
-      env {
-        name  = "MAX_RAG_PAGES"
-        value = "25"
-      }
-      env {
-        name  = "MAX_RAG_CHUNKS"
-        value = "200"
-      }
 
       # LLM keys (injected from Secret Manager at run time)
       dynamic "env" {
