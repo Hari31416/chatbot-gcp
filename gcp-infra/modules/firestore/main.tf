@@ -26,3 +26,18 @@ resource "google_firestore_field" "conversation_id_index" {
   }
 }
 
+resource "google_firestore_index" "rag_chunks_vector" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "rag_chunks"
+
+  fields {
+    field_path = "embedding"
+    vector_config {
+      dimension = 768
+      flat {}
+    }
+  }
+}
+
+

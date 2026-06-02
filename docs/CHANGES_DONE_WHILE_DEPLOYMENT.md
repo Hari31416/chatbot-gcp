@@ -288,11 +288,78 @@ CMD ["/bin/sh", "-c", "python -m uvicorn app.main:app --host 0.0.0.0 --port ${PO
 
 ---
 
-## 8. Verification and Next Steps
+## 8. dynamic Deployment Image Reset Conflict
 
-1. To apply all fixes (both index exemptions, custom model settings, and ghcr.io bypasses), deploy the FastAPI backend and RAG Ingestion worker services:
+### The Issue
+Because Terraform variables (`api_image` and `worker_image`) default to the `"gcr.io/cloudrun/hello"` placeholder, executing `deploy-backend.sh` without supplying the worker image would overwrite the ingestion worker with a Hello World container (and vice versa for `deploy-worker.sh` resetting the API). The placeholder container blindly intercepts event triggers with a `200` response but does not execute any application code, preventing RAG document ingestion.
+
+### Implemented Solution
+We updated both [deploy-backend.sh](file:///Users/hari/Desktop/sandbox/chatbot-gcp/deploy-backend.sh) and [deploy-worker.sh](file:///Users/hari/Desktop/sandbox/chatbot-gcp/deploy-worker.sh) to dynamically query the live, active container image of the other service via the `gcloud run services describe` CLI before running Terraform. The active image is passed dynamically into the `terraform apply` step, fully preserving the running state of both services and breaking the reset override conflict.
+
+---
+
+## 9. CORS & Custom Authorization Mismatch
+
+### The Issue
+Following the integration of Firebase passwordless authentication, the frontend began sending custom `Authorization: Bearer <token>` headers on all API requests. Standard browsers block authorized requests when the backend returns a wildcard `*` for allowed origins while having `allow_credentials = True` active.
+
+### Implemented Solution
+We edited [backend/app/main.py](file:///Users/hari/Desktop/sandbox/chatbot-gcp/backend/app/main.py) to declare an explicit list of allowed origins. It dynamically combines local development ports (`3000`, `3333`, `5173`) with your custom Firebase hosting domains (`https://{project_id}.web.app` and `https://{project_id}.firebaseapp.com`) loaded from environment parameters. We also updated the deployment scripts to automatically forward the custom text model `LITELLM_BASE_URL` to Cloud Run, resolving the `invalid_issuer` API gateway auth error.
+
+---
+
+## 10. Light Mode Default & UI Lock
+
+### The Issue
+To lock the application aesthetic to light mode by default, the UI must prevent any manual or keyboard toggling to dark mode.
+
+### Implemented Solution
+* **Default Theme State:** Updated [frontend/src/main.tsx](file:///Users/hari/Desktop/sandbox/chatbot-gcp/frontend/src/main.tsx) and [frontend/src/components/theme-provider.tsx](file:///Users/hari/Desktop/sandbox/chatbot-gcp/frontend/src/components/theme-provider.tsx) to default the ThemeProvider value to `"light"`.
+* **Keyboard Shortcut Block:** Removed the `D` keydown event listener inside the `ThemeProvider` to completely block manual keyboard dark mode toggling.
+* **Theme Selector Removal:** Removed the light/dark toggle button from the sidebar bottom action menu inside [frontend/src/components/Sidebar.tsx](file:///Users/hari/Desktop/sandbox/chatbot-gcp/frontend/src/components/Sidebar.tsx) and aligned the log-out button cleanly to the right side.
+* **TypeScript Integrity:** Cleaned up all unused destructured variables and imports in `App.tsx` and `Sidebar.tsx` to ensure absolute compliance with the strict compiler rules, producing a successful production build.
+
+---
+
+## 11. Firestore Native Vector Search Index
+
+### The Issue
+RAG document ingestion produces text embeddings that are stored inside the `rag_chunks` subcollection. During ingestion/document searches, Firestore Native requires a flat vector index on the `embedding` field to index and query vector spaces. Without it, transactions fail with a `400 Missing vector index` error.
+
+### Implemented Solution
+* **CLI index provisioning:** Triggered immediate asynchronous index creation on Google Cloud:
+  ```bash
+  gcloud firestore indexes composite create \
+    --project=rag-chatbot-hari31416 \
+    --collection-group=rag_chunks \
+    --query-scope=COLLECTION \
+    --field-config=vector-config='{"dimension":"768","flat": "{}"}',field-path=embedding
+  ```
+* **IaC Declarative setup:** Configured the index inside the Firestore Terraform module [gcp-infra/modules/firestore/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/firestore/main.tf) to make it highly reproducible:
+  ```hcl
+  resource "google_firestore_index" "rag_chunks_vector" {
+    project    = var.project_id
+    database   = google_firestore_database.default.name
+    collection = "rag_chunks"
+
+    fields {
+      field_path = "embedding"
+      vector_config {
+        dimension = 768
+        flat {}
+      }
+    }
+  }
+  ```
+
+---
+
+## 12. Verification and Next Steps
+
+1. To apply all fixes (CORS, Light mode lock, Vector index declarative configs, and dynamic preservation), run the deployments:
    ```bash
-   ./deploy-backend.sh
-   ./deploy-worker.sh
+   make deploy-backend
+   make deploy-worker
+   make deploy-frontend
    ```
-2. Verify that the build succeeds without timing out, and chat streams successfully without any errors!
+2. Verify that the build succeeds without timing out, the RAG chunks ingest cleanly once the GCP vector index is `READY`, and the chat stream interface functions smoothly!
