@@ -45,6 +45,7 @@ add_var() {
 }
 
 add_var "LITELLM_MODEL"
+add_var "LITELLM_BASE_URL"
 add_var "LITELLM_VISION_MODEL"
 add_var "LITELLM_EMBEDDING_MODEL"
 add_var "EMBEDDING_DIMENSION"
