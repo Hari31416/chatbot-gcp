@@ -104,6 +104,7 @@ resource "google_cloud_run_v2_service" "worker" {
           cpu    = "1"
           memory = "1Gi"
         }
+        cpu_idle = true
       }
       env {
         name  = "GCP_PROJECT_ID"

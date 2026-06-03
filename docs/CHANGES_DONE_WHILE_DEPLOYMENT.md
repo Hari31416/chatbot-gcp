@@ -50,6 +50,12 @@ We updated the Firestore module to automatically configure a single-field index 
 ### Solution E: Dynamic Environment Variables Passing (The Cloud Run, Ingestion, and Deploy Modules)
 We updated the Terraform modules and deployment scripts to dynamically compile all active `.env` configuration keys (e.g. `LITELLM_MODEL`, `LITELLM_VISION_MODEL`, etc.) at deploy-time. These are passed as a JSON-encoded map (`additional_env_vars`) to Terraform, which dynamically mounts them on the Cloud Run and Ingestion Worker containers. This ensures the backend containers run with the correct production configurations and prevents them from falling back to hardcoded defaults (like `gpt-4o-mini`).
 
+### Solution F: RAG File-filtering Composite Vector Index (The Firestore Module)
+We added a composite vector index on the `rag_chunks` collection (query scope `COLLECTION`) for the `sourceDoc` field (ascending) and `embedding` field (vector). This enables user query searches to filter similarity results by specific documents (RAG with file selection) without causing Firestore 400 index errors.
+
+### Solution G: Cloud Run Idle CPU Throttling (The Cloud Run & Ingestion Modules)
+We updated both Cloud Run service resources to explicitly set `cpu_idle = true` inside their `resources` blocks. By default, specifying container limits (`limits = { cpu = "...", memory = "..." }`) without explicitly declaring `cpu_idle` in Terraform causes GCP to configure the CPU as "always allocated" (`run.googleapis.com/cpu-throttling = false`). This results in continuous active billing and bypasses the Cloud Run Free Tier. Forcing `cpu_idle = true` guarantees that the instances throttle CPU usage when idle, qualifying them for the Cloud Run Free Tier and preventing background billing.
+
 ---
 
 ## 4. Firestore Collection Group Index Exemption
@@ -156,7 +162,7 @@ resource "google_secret_manager_secret_version" "app" {
 ```
 
 ### B. [gcp-infra/modules/cloud-run/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/cloud-run/main.tf)
-Introduced explicit `depends_on` constraints and `deletion_protection = false` on `chatbot-api`:
+Introduced explicit `depends_on` constraints, `deletion_protection = false`, and `cpu_idle = true` on `chatbot-api`:
 
 ```hcl
 resource "google_cloud_run_v2_service" "api" {
@@ -174,12 +180,23 @@ resource "google_cloud_run_v2_service" "api" {
 
   template {
     # ...
+    containers {
+      image = var.api_image
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "512Mi"
+        }
+        cpu_idle = true # Enable request-based billing (free tier eligible)
+      }
+      # ...
+    }
   }
 }
 ```
 
 ### C. [gcp-infra/modules/ingestion/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/ingestion/main.tf)
-Introduced identical IAM `depends_on` constraints and `deletion_protection = false` on the background RAG worker service:
+Introduced identical IAM `depends_on` constraints, `deletion_protection = false`, and `cpu_idle = true` on the background RAG worker service:
 
 ```hcl
 resource "google_cloud_run_v2_service" "worker" {
@@ -196,12 +213,23 @@ resource "google_cloud_run_v2_service" "worker" {
 
   template {
     # ...
+    containers {
+      image = var.worker_image
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "1Gi"
+        }
+        cpu_idle = true # Enable request-based billing (free tier eligible)
+      }
+      # ...
+    }
   }
 }
 ```
 
 ### D. [gcp-infra/modules/firestore/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/firestore/main.tf)
-Added `google_firestore_field` to automatically establish the required collection group index exemption for the persistence layer:
+Added `google_firestore_field` to establish the collection group index exemption for conversations, and `google_firestore_index` for the `rag_chunks` composite vector index (with `sourceDoc` and `embedding` fields):
 
 ```hcl
 resource "google_firestore_field" "conversation_id_index" {
@@ -218,6 +246,31 @@ resource "google_firestore_field" "conversation_id_index" {
     indexes {
       order       = "DESCENDING"
       query_scope = "COLLECTION_GROUP"
+    }
+  }
+}
+
+resource "google_firestore_index" "rag_chunks_source_doc_vector" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "rag_chunks"
+  query_scope = "COLLECTION"
+
+  fields {
+    field_path = "sourceDoc"
+    order      = "ASCENDING"
+  }
+
+  fields {
+    field_path = "__name__"
+    order      = "ASCENDING"
+  }
+
+  fields {
+    field_path = "embedding"
+    vector_config {
+      dimension = 768
+      flat {}
     }
   }
 }
@@ -389,12 +442,52 @@ We also added `google_project_iam_member.worker_documentai` to the `google_cloud
 
 ---
 
-## 15. Verification and Next Steps
+## 16. Missing Firestore RAG Composite Vector Index
 
-1. Execute the deployment script for the worker to apply these changes (IAM permissions, index schema alignment, and worker environment settings):
+### The Error
+```text
+Failed: 400 Missing vector index configuration. Please create the required index with the following gcloud command: gcloud firestore indexes composite create --project=rag-chatbot-hari31416 --collection-group=rag_chunks --query-scope=COLLECTION --field-config=order=ASCENDING,field-path=sourceDoc --field-config=vector-config='{"dimension":"768","flat": "{}"}',field-path=embedding
+```
+
+### Root Cause
+When running RAG with file selection, the backend queries the Firestore vector store using a filter on the `sourceDoc` field (to restrict search to selected files) in addition to performing the vector similarity search on `embedding`. Firestore requires a composite vector index matching both fields to execute this hybrid query.
+
+### Implemented Solution
+1. **Immediate CLI Deployment**: Created the composite index on GCP Firestore by executing the required `gcloud` command.
+2. **Infrastructure as Code (IaC) Integration**: Added the `google_firestore_index.rag_chunks_source_doc_vector` resource to [gcp-infra/modules/firestore/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/firestore/main.tf) to prevent local Terraform configuration drift during redeployments.
+
+---
+
+## 17. Cloud Run CPU Throttling (Always Allocated billing fix)
+
+### The Issue
+GCP billing reports showed unexpected, continuous daily charges for the Cloud Run resources despite very low PoC traffic.
+
+### Root Cause
+In Terraform `google_cloud_run_v2_service`, defining container resources (like `limits = { cpu = "1", memory = "512Mi" }`) without explicitly declaring the `cpu_idle` property defaults `cpu_idle` to `false`. This translates to GCP Cloud Run's **"CPU is always allocated"** billing model (`run.googleapis.com/cpu-throttling: false`), which bills for active instances 24/7 (even when idle, waiting for requests) and **bypasses the Cloud Run Free Tier**.
+
+### Implemented Solution
+We updated both [gcp-infra/modules/cloud-run/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/cloud-run/main.tf) and [gcp-infra/modules/ingestion/main.tf](file:///Users/hari/Desktop/sandbox/chatbot-gcp/gcp-infra/modules/ingestion/main.tf) to explicitly declare `cpu_idle = true` inside the resources configurations:
+```hcl
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "..."
+        }
+        cpu_idle = true # CPU is throttled when idle, making it eligible for the Free Tier
+      }
+```
+This forces request-based CPU allocation, so you only pay for CPU active time, and usage falls under the Cloud Run Free Tier.
+
+---
+
+## 18. Verification and Next Steps
+
+1. Execute the infrastructure update command (or run deployment scripts) to apply these changes (Firestore vector index and CPU idling billing fixes):
    ```bash
-   ./deploy-worker.sh
+   make deploy-infra
    ```
 2. Verify that:
-   * The Firestore vector index is created cleanly with 0 errors.
-   * Uploading a PDF document parses successfully without `500` errors, chunks the text, and stores the resulting text/embeddings inside Firestore Native!
+   * The Firestore composite vector index is created cleanly on GCP.
+   * Running RAG searches with selected files succeeds with no missing index errors.
+   * Both Cloud Run service specs indicate that CPU throttling is enabled (`run.googleapis.com/cpu-throttling: 'true'`), stopping background idle usage billing.

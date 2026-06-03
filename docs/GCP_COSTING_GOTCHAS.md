@@ -383,11 +383,47 @@ Reference: [Cloud Billing budgets](https://cloud.google.com/billing/docs/how-to/
 
 ---
 
+### Trap #16 — CPU Always Allocated (Idle CPU Billing)
+
+| Setting           | Impact                                                                                    |
+| :---------------- | :---------------------------------------------------------------------------------------- |
+| `cpu_idle = true`  | Correct for PoC: CPU is throttled when idle. Eligible for the Cloud Run Free Tier.        |
+| `cpu_idle = false` | CPU is always allocated. You are billed for idle container instances 24/7 (No Free Tier).  |
+
+**Warning:** In the Terraform `google_cloud_run_v2_service` resource, specifying container limits (`limits = { cpu = "...", memory = "..." }`) without explicitly declaring the `cpu_idle` property defaults `cpu_idle` to `false` (always allocated). This triggers continuous background billing even when no traffic is hitting the service.
+
+Always set:
+
+```hcl
+resources {
+  limits = {
+    cpu    = "1"
+    memory = "512Mi"
+  }
+  cpu_idle = true
+}
+```
+
+Verify:
+
+```bash
+gcloud run services describe chatbot-api \
+  --region asia-south1 \
+  --format='yaml(spec.template.metadata.annotations)'
+```
+
+Look for `run.googleapis.com/cpu-throttling: 'true'` in the annotations to confirm request-based billing is active.
+
+Reference: [Cloud Run CPU Allocation](https://cloud.google.com/run/docs/configuring/cpu-allocation)
+
+---
+
 ## Recommended PoC Guardrails
 
 | Setting                            | Recommended Value     |
 | :--------------------------------- | :-------------------- |
 | `GCP_REGION`                       | `asia-south1`         |
+| Cloud Run CPU Allocation           | `cpu_idle = true`     |
 | Cloud Run API minimum instances    | `0`                   |
 | Cloud Run API maximum instances    | `3`                   |
 | Cloud Run worker minimum instances | `0`                   |
@@ -409,6 +445,7 @@ Reference: [Cloud Billing budgets](https://cloud.google.com/billing/docs/how-to/
 - [ ] A `$10` budget alert exists with `50%`, `90%`, and `100%` thresholds.
 - [ ] Firestore uses only the `(default)` database.
 - [ ] Cloud Run API and worker use `min_instance_count = 0`.
+- [ ] Cloud Run API and worker services explicitly enable `cpu_idle = true`.
 - [ ] Both Cloud Run services have conservative maximum instance counts.
 - [ ] The GCS bucket is Standard storage with seven-day cleanup for temporary prefixes.
 - [ ] Pub/Sub messages contain object metadata only.
