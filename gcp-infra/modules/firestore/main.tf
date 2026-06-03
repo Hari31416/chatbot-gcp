@@ -45,4 +45,24 @@ resource "google_firestore_index" "rag_chunks_vector" {
   }
 }
 
+resource "google_firestore_index" "rag_chunks_source_doc_vector" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "rag_chunks"
+  query_scope = "COLLECTION"
+
+  fields {
+    field_path = "sourceDoc"
+    order      = "ASCENDING"
+  }
+
+  fields {
+    field_path = "embedding"
+    vector_config {
+      dimension = 768
+      flat {}
+    }
+  }
+}
+
 
