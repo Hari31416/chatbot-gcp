@@ -1,6 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
+# Load environment variables from .env if present (for direct script invocation)
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
 echo "Building frontend..."
 cd frontend
 pnpm install --frozen-lockfile
